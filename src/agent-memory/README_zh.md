@@ -63,6 +63,27 @@ openclaw gateway restart
 }
 ```
 
+### 核心操作
+
+```bash
+# 初始化命名空间
+agent-memory init
+
+# 打印解析后的配置
+agent-memory info
+```
+
+作为 MCP server 运行后，agent 通过以下工具交互：
+
+| 操作 | MCP 工具 |
+|------|----------|
+| 写入记忆 | `mem_write(path, content)` |
+| 读取记忆 | `mem_read(path)` |
+| 搜索 | `memory_search(query, mode="hybrid")` |
+| 观察 | `memory_observe(content, type)` |
+| 获取上下文 | `memory_get_context(max_tokens)` |
+| 快照 | `mem_snapshot(name)` |
+
 OpenClaw 插件通过 `anolisa_memory_search` 和 `anolisa_memory_get` 访问 ANOLISA
 记忆，另提供 `memory_observe` 和 `memory_get_context`。升级时请更新提示词和白名单
 中的旧工具名，重启 gateway 并开始新会话；内部 MCP 方法名和数据保持不变。
@@ -77,6 +98,10 @@ OpenClaw 自动记录通过 `memory_capture` 在写入前检查当前采集授�
 
 对于单行列表条目，`memory_summary` 的概念和文件排名在 `mem_export` / `mem_import`
 往返后仍然可用，包括名称中含逗号的条目。导入时会将 frontmatter 中的换行等 ASCII 控制字符替换为空格。
+
+在 TOML 中选择 embedding provider 后，无需重复设置后端环境变量，也可使用对应的
+`MEMORY_OPENAI_*` 或 `MEMORY_OLLAMA_*` 字段覆盖。密钥优先级和模型变更时的索引限制
+见[配置指南](../../docs/user-guide/zh/agent-memory/index.md)。
 
 ## 架构
 
