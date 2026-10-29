@@ -2,6 +2,8 @@
 
 use aw_package::{Error, Result};
 use std::path::PathBuf;
+#[path = "support/arguments.rs"]
+mod arguments;
 #[path = "support/signals.rs"]
 mod signals;
 
@@ -13,13 +15,14 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut args = std::env::args().skip(1);
+    // std::env::args panics on non-UTF-8 arguments; reject them cleanly first.
+    let mut args = arguments::decode_all(std::env::args_os().skip(1))?.into_iter();
     let mut version = None;
     let mut output = None;
     let mut component = None;
     while let Some(flag) = args.next() {
         if flag == "--help" {
-            println!("aw-build --version X.Y.Z-preview.N --output ABS_DIR [--component core|sec-core|all]");
+            println!("aw-build --version X.Y.Z-preview.N --output ABS_DIR [--component core|sec-core|tokenless|all]");
             return Ok(());
         }
         let value = args
@@ -37,10 +40,11 @@ fn run() -> Result<()> {
     let selection = match component.as_deref().unwrap_or("core") {
         "core" => aw_package::package::Selection::Core,
         "sec-core" => aw_package::package::Selection::SecCore,
+        "tokenless" => aw_package::package::Selection::Tokenless,
         "all" => aw_package::package::Selection::All,
         _ => {
             return Err(Error::Invalid(
-                "--component must be core, sec-core or all".into(),
+                "--component must be core, sec-core, tokenless or all".into(),
             ))
         }
     };
