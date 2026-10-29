@@ -532,7 +532,13 @@ fn category_filtered_search_does_not_keep_memory_warm() {
         )
         .unwrap();
     index
-        .reindex_file("facts/lesson/kept.md", LESSON, old_ms, LESSON.len() as u64, None)
+        .reindex_file(
+            "facts/lesson/kept.md",
+            LESSON,
+            old_ms,
+            LESSON.len() as u64,
+            None,
+        )
         .unwrap();
 
     // Both facts match the query, but category=lesson drops the interest one:
