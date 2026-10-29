@@ -9,6 +9,37 @@ Tokenless 的所有重要变更都会记录在此文件中。
 
 ## [未发布]
 
+## [0.9.1] - 2026-10-29
+
+### 修复
+
+- Qoder 压缩 stdout 时保留原生 Bash 结果封装，保留退出状态和遥测字段，不再将它们序列化到模型文本中。其他结果形态保持原有替换行为（[#9226](https://github.com/agentic-os-org/ANOLISA/pull/9226)）。
+- 可识别的 `head` 和 `tail` 命令现在保持原生执行，包括受支持的包装命令和包含它们的复合命令，从而保留请求的行范围。显式 RTK 调用和自定义 RTK 包装前缀保持原有行为（[#9226](https://github.com/agentic-os-org/ANOLISA/pull/9226)）。
+- QwenWork 工作区 Hook 默认使用系统用户的 `~/.tokenless` 目录，并遵循绝对路径的 `TOKENLESS_DATA_DIR`，在工作目录变化时仍将状态保存在同一位置。已有工作区历史不会自动迁移。安装和检测命令会报告解析后的目录，并说明 Shell 沙箱权限可能导致 RTK 统计和执行凭据无法保存（[#9215](https://github.com/agentic-os-org/ANOLISA/pull/9215)）。
+- unittest 和 Django 的详细测试日志现在可以压缩重复的成功测试记录，同时保留汇总、非通过结果、异常堆栈和数据库初始化输出。原文仍可恢复，多行描述和未知输出保持原样（[#9083](https://github.com/agentic-os-org/ANOLISA/pull/9083)）。
+- HTML 表格中的 `rowspan="0"` 现在延伸到当前行组末尾，并使单元格保持在正确的列标题下。原始页面仍可逐字节恢复（[#9012](https://github.com/agentic-os-org/ANOLISA/pull/9012)）。
+- Windows 构建现在从 Cargo 解析出的目标目录收集本次构建的 Tokenless 和 RTK 可执行文件，避免环境变量或配置重定向构建输出后出现产物缺失或误用旧文件（[#9018](https://github.com/agentic-os-org/ANOLISA/pull/9018)）。
+
+## [0.9.0] - 2026-10-25
+
+### 新增
+
+- Windows x64 支持包括原生 CLI、内置 RTK、npm 启动器、Python ABI3 Wheel，以及用于本地会话的 QwenWork 适配器。发布构建生成 Windows ZIP 和 Wheel 产物；npm 安装仍需等待单独的 registry 发布。暂不支持 Windows ARM 和 QwenWork VM 会话（[#8853](https://github.com/agentic-os-org/ANOLISA/pull/8853)、[#9011](https://github.com/agentic-os-org/ANOLISA/pull/9011)、[#9015](https://github.com/agentic-os-org/ANOLISA/pull/9015)）。
+- Intel Mac（macOS x86_64）现已纳入 raw 归档、npm 二进制和 Python Wheel 的发布构建目标。npm 安装仍需等待单独的 registry 发布（[#8770](https://github.com/agentic-os-org/ANOLISA/pull/8770)）。
+
+### 变更
+
+- **Rust 调用方的不兼容变更：** 从 `JsonCompressionConfig` 初始化代码中移除 `drop_nulls` 和 `drop_empty_fields`，从 `JsonCompressionContext` 初始化代码中移除 `preserve_top_level_shape`。完整 JSON 候选现在保留全部字段和空值，包括数组位置；部分输入的 Token 节省会减少或保持原样。显式截断和记录缩减保留原有恢复策略，CLI 参数不变（[#8814](https://github.com/agentic-os-org/ANOLISA/pull/8814)）。
+- TOON 编码采用 spec v4.4，更紧凑地表示嵌套记录数组和按 ID 索引的对象。消费新的嵌套与键索引头部前，需将解码器使用的 `toon-format` 从 0.5.0 升级到 0.7.0。此前保存的无效空对象数组文档仍需从原始 JSON 恢复，codec 更新不会修复这些文档（[#7752](https://github.com/agentic-os-org/ANOLISA/pull/7752)）。
+
+### 修复
+
+- JSON 压缩和 Stash 恢复保留原始数字字面量，避免精度损失。TOON 候选必须保留留下的数值和数字类型，否则压缩保留精确 JSON，直接调用 `compress-toon` 则逐字节返回原始输入（[#7784](https://github.com/agentic-os-org/ANOLISA/pull/7784)、[#7752](https://github.com/agentic-os-org/ANOLISA/pull/7752)）。
+- 所有被跟踪的 RTK 调用都明确报告输出逐字节未变，且实际执行命令匹配时，PostTool 可继续压缩。输出已变或证据缺失、过期、不匹配时仍跳过 RTK 结果；不支持恢复的适配器仍只使用无损候选（[#8901](https://github.com/agentic-os-org/ANOLISA/pull/8901)）。
+- `compress-response` 和 `compress-schema` 现在逐字节输出载荷，不再追加换行。实际压缩模式的统计与输出字节一致；dry-run 仍输出原始输入并记录预测节省（[#7789](https://github.com/agentic-os-org/ANOLISA/pull/7789)）。
+- stderr 不可写时，提示消息不再使已成功的压缩、原样输出或统计操作发生 panic（[#7796](https://github.com/agentic-os-org/ANOLISA/pull/7796)、[#7752](https://github.com/agentic-os-org/ANOLISA/pull/7752)）。
+- Codex 适配器安装与卸载命令在 `ANOLISA_DRY_RUN=1` 下按真实生命周期分支预览操作，不修改文件或注册。二进制和源码目录均缺失时会提前失败，不再预览实际安装无法到达的步骤（[#7723](https://github.com/agentic-os-org/ANOLISA/pull/7723)）。
+
 ## [0.8.8] - 2026-10-21
 
 ### 新增

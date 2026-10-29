@@ -41,6 +41,14 @@ cat response.json | tokenless compress-response
 - The per-call input limit is 64 MiB.
 - JSON commands require valid JSON.
 - If compression does not reduce the estimated token count, the CLI explains this on stderr and returns the original.
+- `compress-schema`, `compress-response`, `compress-toon`, and `retrieve` write their payload to stdout
+  byte-for-byte: no trailing newline is added or stripped. Passthrough and no-savings runs therefore
+  reproduce the input exactly, so comparing stdout with the input payload is a reliable encoding check.
+  For the compression commands the emitted bytes equal the `after` text the statistics recorder
+  measures in active mode; in dry-run mode (`TOKENLESS_COMPRESSION_ENABLED=0`) the two differ, because
+  stdout keeps the original input while the record stores the smaller predicted candidate as
+  `after_text`. A dry-run record's `after_chars` and `after_tokens` therefore describe a predicted
+  saving, not the bytes emitted (see [Minimum useful payload](#minimum-useful-payload)).
 
 ### Minimum useful payload
 
@@ -112,7 +120,12 @@ Operations:
 
 `post_tool` is the only operation that enters `PostToolPipeline`. Current production routing is:
 
-- Retrieve results, interrupted or denied calls, and RTK-optimized output bypass compression.
+- Retrieve results and interrupted or denied calls bypass compression.
+- RTK output bypasses compression unless complete execution receipts confirm unchanged bytes and
+  the call succeeded. PostTool must supply the exact registered execution command in `command`;
+  a missing or modified command retains the bypass. Core restores the original command before routing. Changed or unconfirmed
+  output retains the bypass; a tied token estimate does not authorize fallback. Receipt-state
+  failures warn and retain the bypass without failing the PostTool operation.
 - Tool errors pass through unchanged and may include bounded `additional_context` diagnostics.
 - Successful JSON uses `JsonCompressor`; compact JSON or TOON may be selected.
 - Recognized successful build/test command output uses `BuildLogCompressor`; terminal cleanup and
@@ -145,14 +158,22 @@ Exit codes are part of the transport contract:
 
 The `pre_tool` operation resolves the separately packaged `rtk` executable from `PATH` and supported
 install layouts, skipping candidates older than 0.35.0 before trying the next packaged location.
-Recognized Cargo, pytest, npm/Jest, Go, and Make build/test commands, plus entire commands containing
-a recognized native `find` invocation, stay native so their output has a single PostTool owner.
-The `find` protection covers direct calls and RTK's built-in prefixes: `env`, `command`, `exec`,
+Recognized Cargo, pytest, npm/Jest, Go, and Make build/test commands stay native so their output has
+a single PostTool owner. Entire commands containing a recognized native `find`, `head`, or `tail`
+invocation also stay native. The protection covers direct calls and RTK's built-in prefixes:
+`env`, `command`, `exec`,
 `noglob`, `nocorrect`, `builtin`, `timeout`, `time`, `nice`, `nohup`, and `uv run`, including nesting
 and shell backslash-newline continuations. Process-wrapper options follow the bundled RTK grammar;
 unknown options stop recognition. This remains true when `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0`.
-Custom `hooks.transparent_prefixes` are not inspected and may still let RTK rewrite wrapped `find`;
+Custom `hooks.transparent_prefixes` are not inspected and may still let RTK rewrite wrapped calls;
 other supported commands may also be rewritten.
+
+`head` and `tail` retain their native execution semantics for all arguments, including byte windows
+and follow mode. If a recognized call appears in a pipeline or compound command, the entire command
+bypasses rewriting. This avoids RTK's `head` → `read --max-lines` structural truncation, which can
+omit function bodies inside the requested line window. Explicit `rtk` commands remain explicit.
+This PreTool rule does not disable eligible PostTool compression; file-read policy is unchanged.
+
 Agent-facing `retrieve` authorizes the requested hash against `visible_markers` before reading Stash.
 The standalone `tokenless retrieve` command below is a separate trusted local operations path and
 does not require model-visibility context.
@@ -189,7 +210,7 @@ is not guaranteed for every shell expression. `sudo` commands pass through uncha
 so automatic rewriting does not insert RTK into a privileged command.
 
 Use `rtk rewrite 'COMMAND'` to inspect a proposed rewrite without executing the
-command. Tokenless keeps its recognized build/test commands and recognized native `find` invocations,
+command. Tokenless keeps its recognized build/test commands and native `find`, `head`, and `tail` calls,
 including whole compound commands containing such a call, outside RTK rewriting as described above. PostTool can
 share profitable pure path lists; mixed output and unsupported `find` formats remain native.
 
@@ -342,7 +363,17 @@ echo '{"name":"test","value":42}' \
   | tokenless decompress-toon
 ```
 
-`compress-toon` supports `--agent-id`, `--session-id`, `--tool-use-id`, and `--min-toon-chars`. When a payload is below the minimum length or encoding provides no savings, it returns the original JSON and does not record that operation. The exit code is still `0` in these passthrough cases, and the note on stderr is informational only: when scripting, detect whether encoding happened by comparing stdout with the input payload instead of relying on stderr. Passthrough and no-savings runs reproduce the input byte-for-byte on stdout (no trailing newline is added or stripped), so any byte difference means the payload was encoded; checking whether stdout is still valid JSON works as a fallback.
+Both commands accept the input as a file instead of standard input:
+
+```bash
+tokenless compress-toon --file payload.json
+tokenless decompress-toon --file payload.toon
+```
+
+`-f` is the short form of `--file`. Without it, the input is read from standard
+input, which is what the examples above use.
+
+`compress-toon` supports `--agent-id`, `--session-id`, `--tool-use-id`, and `--min-toon-chars`. When a payload is below the minimum length, holds a number TOON cannot carry exactly (`1e-400`, `-0.0`, `1e3`, or a decimal longer than an `f64`), or encoding provides no savings, it returns the original JSON and does not record that operation. The exit code is still `0` in these passthrough cases, and the note on stderr is informational only: when scripting, detect whether encoding happened by comparing stdout with the input payload instead of relying on stderr. Passthrough and no-savings runs reproduce the input byte-for-byte on stdout (no trailing newline is added or stripped), so any byte difference means the payload was encoded; checking whether stdout is still valid JSON works as a fallback.
 
 ## `retrieve`
 

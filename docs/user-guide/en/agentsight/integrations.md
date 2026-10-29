@@ -31,9 +31,19 @@ Anything else works too — add a rule, as described in
   bounded nested discovery labels those sessions as `claude-code` rather than Qoder.
 - **OpenClaw** is observed through its `openclaw-gateway` daemon, not the client. If Token data is
   missing, check that the client actually reaches the gateway.
-- **Codex CLI** statically links its TLS library, so AgentSight falls back to byte-pattern matching
-  and a per-version offset table. A brand-new Codex release may need a refreshed entry in
-  `codex_offsets`.
+- **Codex CLI** statically links its TLS library. The embedded offset table includes the official
+  Linux x86_64 musl builds of 0.147.0 and 0.162.1, validated for OpenSSL-based HTTPS Responses calls.
+  Entries match the executable size and fingerprint, not just its version string. Updating
+  `codex_offsets` in a deployed config alone has no effect: the table is compiled into AgentSight,
+  so use a binary rebuilt with the new entries. Requests sent before the probe attaches may still
+  be missed. Custom CA settings such as `CODEX_CA_CERTIFICATE` or `SSL_CERT_FILE` can select rustls;
+  these OpenSSL offsets do not cover that transport or WebSocket TLS.
+- **Gemini CLI** trajectories are collected from the session files under
+  `~/.gemini/tmp/<project>/chats/session-*.jsonl`, no configuration needed. Project names come from
+  each project directory's `.project_root` marker. The collector replays the CLI's correction records
+  (`$rewindTo`, `$patch`, `$set`) before converting, so a collected trajectory matches the
+  conversation the CLI itself would resume; sub-agent transcripts nested under the parent session id
+  are collected as sub-agent trajectories.
 - **Hermes** trajectories are also available without eBPF. The trajectory collector opens
   `$HERMES_HOME/state.db` read-only, converts active messages, reasoning, tool calls, tool results,
   and session Token totals to ATIF v1.7, and follows committed SQLite WAL updates. When `scan_dirs`
@@ -130,6 +140,12 @@ $ sudo journalctl -u agentsight-enforcer
 
 The default level is `info`; add `Environment=RUST_LOG=debug` to the unit for verbose output.
 
+System-level file deletion protection is not available out of the box with the default
+profile. Even when `ready=true`, check `capabilities.file_delete_guard`; the default
+`credential-exfiltration` profile does not provide it. See
+[Enable system-level file deletion protection](deployment.md#enable-system-level-file-deletion-protection)
+for prerequisites, the mutually exclusive capability, maintenance window, and re-apply steps.
+
 Blocking also depends on the engine's hook budget: a `block` rule can only deny an operation when
 the matching BPF LSM hook was reserved at engine start and BPF LSM is active on the kernel
 (`bpf` listed in `/sys/kernel/security/lsm`). When a `block` rule matches on a backend that cannot
@@ -138,6 +154,11 @@ not attached — the engine still reports the match as a violation with `effect=
 `blocked=false`. Treat such degraded reports as a signal that the policy cannot actually deny;
 check the engine profile (`ACTPLANE_HOOK_PROFILE` / `ACTPLANE_PINNED_PROFILE`) and the kernel's LSM
 configuration.
+
+Protocol v5 adds a versioned `file_protection_policy` payload, mutually exclusive with `policy_dsl`.
+Current backends reject structured policies without changing bindings; the new file-protection
+capabilities remain false. Existing DSL semantics are retained, but v4 clients must upgrade with
+the enforcer because protocol v4 frames are rejected.
 
 ## cosh: ask in natural language
 

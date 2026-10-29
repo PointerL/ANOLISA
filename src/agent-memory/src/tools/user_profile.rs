@@ -15,7 +15,7 @@ use std::path::Path;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::audit::AuditEntry;
+use crate::audit::{AuditEntry, is_sanitized_query_path};
 use crate::error::Result;
 use crate::service::MemoryService;
 
@@ -142,13 +142,22 @@ fn analyze_session_logs(dir: &Path, profile: &mut UserProfile) -> Result<()> {
             // Track tool frequency
             *tool_frequency.entry(tool.to_string()).or_insert(0) += 1;
 
-            // Track search topics. `memory_search` logs the query *length*,
-            // not the query (see audit::search_query), and `mem_grep` logs the
-            // directory it walked — counting either as a topic used to report
-            // "interested in: len=14", whose evidence_count ≥ 2 then outranked
-            // the single-evidence entries the fact and note phases contribute.
-            if let Some(query) = crate::audit::search_query(tool, path_str) {
-                *search_topics.entry(query.to_lowercase()).or_insert(0) += 1;
+            // Track search topics. `memory_search` logs a sanitized
+            // `<mode>:len=<bytes>` marker instead of the query, and the query
+            // is unrecoverable from it — counting the marker would synthesize
+            // a permanent "interested in: len=9" topic out of nothing. Rows
+            // that recorded a query are left alone, including legacy ones whose
+            // query itself ends in a `len=<digits>`-looking segment
+            // (`bm25:packet:len=14` recorded `packet:len=14`).
+            if (tool == "memory_search" || tool == "mem_grep") && !is_sanitized_query_path(path_str)
+            {
+                // Extract query from path field (format: "mode:query")
+                if let Some(query) = path_str.split(':').nth(1) {
+                    let query = query.trim().to_lowercase();
+                    if query.len() > 3 {
+                        *search_topics.entry(query).or_insert(0) += 1;
+                    }
+                }
             }
 
             // Track edited files
@@ -403,62 +412,6 @@ mod tests {
         assert_eq!(body, "Just plain text.");
     }
 
-    /// Write a session-log JSONL file the way the session mirror does and
-    /// return the profile `analyze_session_logs` builds from it.
-    fn profile_from_session_log(lines: &[&str]) -> UserProfile {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ses_1.jsonl"), lines.join("\n") + "\n").unwrap();
-        let mut profile = UserProfile::default();
-        analyze_session_logs(dir.path(), &mut profile).unwrap();
-        profile
-    }
-
-    fn entry(tool: &str, path: &str) -> String {
-        format!(
-            "{{\"ts\":\"2026-09-25T00:00:00Z\",\"tool\":\"{tool}\",\"path\":\"{path}\",\"ok\":true}}"
-        )
-    }
-
-    #[test]
-    fn search_topics_ignore_the_sanitized_length_marker() {
-        // memory_search logs "<mode>:len=<N>". Two searches whose queries
-        // happen to be the same length used to add up to a
-        // "interested in: len=9" context entry.
-        let profile = profile_from_session_log(&[
-            &entry("memory_search", "bm25:len=9"),
-            &entry("memory_search", "bm25(fallback from hybrid):len=9"),
-            &entry("mem_grep", "notes/kconfig"),
-        ]);
-
-        assert_eq!(profile.tool_calls_analyzed, 3);
-        assert!(
-            profile.context.is_empty(),
-            "audit marker read as a search topic: {:?}",
-            profile
-                .context
-                .iter()
-                .map(|e| &e.description)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn search_topics_still_count_a_query_that_was_logged() {
-        // The shape that does carry a query keeps feeding the dimension, so
-        // only the marker is refused.
-        let profile = profile_from_session_log(&[
-            &entry("memory_search", "bm25:Rust Ownership"),
-            &entry("memory_search", "bm25:rust ownership"),
-        ]);
-
-        let topics: Vec<(&str, usize)> = profile
-            .context
-            .iter()
-            .map(|e| (e.description.as_str(), e.evidence_count))
-            .collect();
-        assert_eq!(topics, vec![("interested in: rust ownership", 2)]);
-    }
-
     #[test]
     fn profile_entry_serialize() {
         let entry = ProfileEntry {
@@ -469,5 +422,90 @@ mod tests {
         let toml_str = toml::to_string(&entry).unwrap();
         assert!(toml_str.contains("test"));
         assert!(toml_str.contains("5"));
+    }
+
+    #[test]
+    fn session_log_reader_counts_only_recorded_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = |tool: &str, path: &str| {
+            serde_json::json!({
+                "ts": "2026-10-04T08:00:00Z",
+                "tool": tool,
+                "path": path,
+                "ok": true,
+            })
+            .to_string()
+        };
+        let log = [
+            // Sanitized markers: two searches of a 9-byte query.
+            row("memory_search", "bm25:len=9"),
+            row("memory_search", "bm25(fallback from hybrid):len=9"),
+            // Legacy rows that still record the query itself.
+            row("memory_search", "bm25:rust ownership"),
+            row("memory_search", "hybrid:Rust Ownership"),
+        ]
+        .join("\n");
+        std::fs::write(dir.path().join("session-1.jsonl"), log + "\n").unwrap();
+
+        let mut profile = UserProfile::default();
+        analyze_session_logs(dir.path(), &mut profile).unwrap();
+
+        let topics: Vec<&str> = profile
+            .context
+            .iter()
+            .map(|e| e.description.as_str())
+            .collect();
+        assert_eq!(
+            topics,
+            ["interested in: rust ownership"],
+            "sanitized markers must not become profile topics"
+        );
+        assert_eq!(profile.tool_calls_analyzed, 4);
+    }
+
+    #[test]
+    fn session_log_reader_keeps_legacy_queries_with_inner_colons() {
+        // Regression: `bm25:packet:len=14` recorded the query `packet:len=14`
+        // before sanitization landed. Treating it as a marker dropped the
+        // `interested in: packet` topic these rows used to synthesize, while a
+        // genuine marker must still contribute nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let row = |path: &str| {
+            serde_json::json!({
+                "ts": "2026-10-04T08:00:00Z",
+                "tool": "memory_search",
+                "path": path,
+                "ok": true,
+            })
+            .to_string()
+        };
+        let log = [
+            row("bm25:packet:len=14"),
+            row("bm25:packet:len=14"),
+            row("bm25:packet:len=14"),
+            row("bm25:len=14"),
+            row("bm25(fallback from hybrid):len=14"),
+        ]
+        .join("\n");
+        std::fs::write(dir.path().join("session-1.jsonl"), log + "\n").unwrap();
+
+        let mut profile = UserProfile::default();
+        analyze_session_logs(dir.path(), &mut profile).unwrap();
+
+        let topics: Vec<&str> = profile
+            .context
+            .iter()
+            .map(|e| e.description.as_str())
+            .collect();
+        assert_eq!(
+            topics,
+            ["interested in: packet"],
+            "legacy rows keep their recorded query; markers stay skipped"
+        );
+        assert_eq!(
+            profile.context[0].evidence_count, 3,
+            "only the three recorded rows count as evidence"
+        );
+        assert_eq!(profile.tool_calls_analyzed, 5);
     }
 }

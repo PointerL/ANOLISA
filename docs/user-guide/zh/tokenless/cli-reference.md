@@ -41,6 +41,12 @@ cat response.json | tokenless compress-response
 - 单次输入上限为 64 MiB。
 - JSON 相关命令要求输入为合法 JSON。
 - 压缩后没有 Token 收益时，CLI 向 stderr 说明原因，并输出原文。
+- `compress-schema`、`compress-response`、`compress-toon` 和 `retrieve` 按字节原样写出 Payload：
+  不添加也不去除末尾换行符。因此透传和无收益场景会逐字节复现输入，比较 stdout 与输入负载
+  即可可靠判断是否发生了压缩或编码。对压缩类命令而言，Active 模式下写出的字节等于统计记录的
+  `after` 文本；Dry-run 模式（`TOKENLESS_COMPRESSION_ENABLED=0`）下两者并不相同，因为 stdout 保留
+  原文，而统计把更小的预测候选记为 `after_text`。所以 Dry-run 记录的 `after_chars` 与
+  `after_tokens` 描述的是预测节省，而不是实际写出的字节（见[最小有效 Payload](#最小有效-payload)）。
 
 ### 最小有效 Payload
 
@@ -108,7 +114,11 @@ jq -n \
 
 只有 `post_tool` 会进入 `PostToolPipeline`。当前生产路由为：
 
-- Retrieve Result、Interrupted/Denied 调用和 RTK 已优化输出绕过压缩。
+- Retrieve Result 和 Interrupted/Denied 调用绕过压缩。
+- RTK 输出默认绕过压缩；只有完整执行回执确认字节未变且调用成功，Core 才恢复原命令并继续路由。
+  PostTool 必须在 `command` 中传入注册的完整执行命令；命令缺失或被修改时保留旁路。
+  输出已改变或无法确认时保留旁路；Token 估算持平不能授权回退。回执状态失败会发出警告并保留
+  旁路，不会使 PostTool 操作失败。
 - Tool Error 原样透传，并可携带限长 `additional_context` 诊断。
 - 成功 JSON 使用 `JsonCompressor`，并可能选择 Compact JSON 或 TOON。
 - 已识别的成功构建/测试命令输出使用 `BuildLogCompressor`，可选择 Terminal Cleanup 和可恢复的
@@ -138,13 +148,21 @@ BeforeModel Schema 的可恢复截断；Shell 恢复用于 PostTool，不新增�
 - `2`：JSON 格式错误、不支持的协议版本，或 Envelope/Payload Shape 无效。
 
 `pre_tool` 从 `PATH` 和支持的安装布局解析独立打包的 `rtk`；低于 0.35.0 的候选会被跳过，
-并继续尝试后续打包位置。已识别的 Cargo、pytest、npm/Jest、Go 和 Make 构建/测试命令，以及
-包含已识别原生 `find` 调用的整条命令保持原生形式，使其输出只有一个 PostTool 所有者。
-`find` 保护覆盖直接调用，以及 RTK 的内置前缀：`env`、`command`、`exec`、`noglob`、`nocorrect`、
+并继续尝试后续打包位置。已识别的 Cargo、pytest、npm/Jest、Go 和 Make 构建/测试命令保持
+原生形式，使其输出只有一个 PostTool 所有者。包含已识别原生 `find`、`head` 或 `tail`
+调用的整条命令也保持原生形式。保护覆盖直接调用，以及 RTK 的内置前缀：
+`env`、`command`、`exec`、`noglob`、`nocorrect`、
 `builtin`、`timeout`、`time`、`nice`、`nohup` 和 `uv run`，支持嵌套和 Shell 反斜杠换行续行。
 进程 Wrapper 参数按随包 RTK 的语法识别，未知参数会停止识别。设置
 `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0` 后仍保持此行为。不会读取自定义 `hooks.transparent_prefixes`，
-此类前缀下的 `find` 仍可能被 RTK 改写；其他受支持命令也仍可由 RTK 改写。Agent-facing
+此类前缀下的调用仍可能被 RTK 改写；其他受支持命令也仍可由 RTK 改写。
+
+`head` 和 `tail` 对所有参数保留原生执行语义，包括字节窗口和持续跟踪模式。
+当已识别的调用出现在 Pipeline 或复合命令中时，整条命令跳过改写。这避免了 RTK 将
+`head` 改写为 `read --max-lines` 后进行结构截断，遗漏请求行范围内的函数体。
+显式 `rtk` 命令仍按显式调用处理。此 PreTool 规则不禁用适用的 PostTool 压缩，文件读取策略不变。
+
+Agent-facing
 `retrieve` 在读取 Stash 前根据 `visible_markers` 授权
 请求 Hash。下文的独立 `tokenless retrieve` 是受信本地运维入口，不要求模型可见性上下文。
 
@@ -177,7 +195,7 @@ RTK 支持跨多行处理已支持的命令，并对 Pipeline 应用保守规则
 Shell 表达式都会被重写。`sudo` 命令保持原样透传，自动重写不会将 RTK 插入特权命令。
 
 使用 `rtk rewrite 'COMMAND'` 可以查看建议的重写结果，而不执行命令。
-Tokenless 按上文规则让已识别的构建/测试命令及已识别的原生 `find` 调用（包括含此类调用的整条复合命令）
+Tokenless 按上文规则让已识别的构建/测试命令及原生 `find`、`head`、`tail` 调用（包括含此类调用的整条复合命令）
 跳过 RTK 改写。PostTool 可以共享有净收益的纯路径列表；混合输出和不支持的 `find` 格式保持原样。
 
 ### 输出恢复
@@ -326,7 +344,16 @@ echo '{"name":"test","value":42}' \
   | tokenless decompress-toon
 ```
 
-`compress-toon` 支持 `--agent-id`、`--session-id`、`--tool-use-id` 和 `--min-toon-chars`。当负载低于最小长度或编码后无收益时会输出原 JSON，且不记录该次统计。这类透传场景退出码仍为 `0`，stderr 上的提示仅供参考：在脚本等自动化场景中，请通过比较 stdout 与输入负载来判断是否发生了编码，不要依赖 stderr。透传和无收益场景会在 stdout 上逐字节原样复现输入（不添加、不去除末尾换行符），任何字节差异都说明负载已被编码；作为兜底，也可以检查 stdout 是否仍为合法 JSON。
+两个命令都支持从文件读取输入，而不必使用标准输入：
+
+```bash
+tokenless compress-toon --file payload.json
+tokenless decompress-toon --file payload.toon
+```
+
+`-f` 是 `--file` 的简写形式。不指定时从标准输入读取，这正是上面示例的用法。
+
+`compress-toon` 支持 `--agent-id`、`--session-id`、`--tool-use-id` 和 `--min-toon-chars`。当负载低于最小长度、含有 TOON 无法精确承载的数值（`1e-400`、`-0.0`、`1e3`，或超出 `f64` 精度的小数），或编码后无收益时会输出原 JSON，且不记录该次统计。这类透传场景退出码仍为 `0`，stderr 上的提示仅供参考：在脚本等自动化场景中，请通过比较 stdout 与输入负载来判断是否发生了编码，不要依赖 stderr。透传和无收益场景会在 stdout 上逐字节原样复现输入（不添加、不去除末尾换行符），任何字节差异都说明负载已被编码；作为兜底，也可以检查 stdout 是否仍为合法 JSON。
 
 ## `retrieve`
 

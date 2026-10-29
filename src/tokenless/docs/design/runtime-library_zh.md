@@ -34,6 +34,13 @@ Rust Core，而不是 Python 配置中。Shell 工具的 `PostToolRequest` 在 `
 执行的命令行；由 Core 而非 Adapter 把只打印本地文件的结果报告为 `file_read`，打印出的
 HTML 页面因此保持原样，输出中的数据仍照常压缩。
 
+PreTool 使用与 `find` 相同的直接调用及内置 Wrapper 识别规则，保留已识别的原生
+`head`、`tail` 调用，支持嵌套和 Shell 换行续行。所有参数形式均保持原生执行，包括字节
+窗口和持续跟踪模式。一旦识别到此类调用，其所在的整条 Pipeline 或复合命令都跳过 RTK
+改写。这避免了 RTK `read --max-lines` 路径的结构截断；显式 RTK 调用保持既有行为。
+不会读取自定义 `hooks.transparent_prefixes`，因此这些前缀下的调用仍可能被改写。
+该规则独立于搜索路径共享开关，保留现有 PostTool 文件读取策略。
+
 SDK 不保存进程级“当前 Session”。`before_model` 返回精确的可见 Marker 集合。Adapter
 声明自己是否已有 Marker 授权恢复路径，并持有面向 Agent 的命令或 Tool 声明。AgentScope
 在模型调用之间保持 Retrieve Tool 静态，把 Marker 集合保存在框架 Session 状态中；`retrieve` 只授权该集合
@@ -117,7 +124,24 @@ PreTool 保留已识别的原生 `find` 调用，以便 PostTool 接收原生结
 Claude Code Adapter 仅提取无上下文选项的原生 Grep `mode=content` 响应，将其文本槽声明为
 API 响应，再只替换原输出对象的 `content` 字段。包括宿主限额在内的其他元数据保持不变；
 完整性指保留收到的所有记录，不表示宿主裁剪前的全部可能命中。
-其他 Grep 模式和宿主保留既有路由。RTK 负责的 Bash 输出继续绕过原生 PostTool 压缩。
+其他 Grep 模式和宿主保留既有路由。
+
+RTK 输出所有权会在执行完成后再次确认。PreTool 在 Runtime 数据目录的 `rtk-outcomes.db`
+原子保存原命令和实际执行的完整命令，并为每条改写后的 RTK 命令分配执行批次和序号，独立于统计开关。随包 RTK 记录
+输出字节是否改变；Token 估算持平或增加不能证明内容未变。PostTool 按 Agent、会话、工具调用
+一次性消费结果之前，要求其 `command` 与记录的命令（含执行批次）完全一致；命令缺失或被修改时
+保留旁路，因此重试注册失败也不能复用旧结果。只有全部输出字节未变且工具执行成功，才使用
+保存的原命令继续进入原有管线，
+保留文件读取来源及其他命令相关保护。重试改写无法跟踪时尝试使前一批次失效；即使失效操作失败，
+命令匹配也阻止此次重试复用旧结果。迟到结果不能重建已删除的批次。
+输出已改变、结果缺失或过期、旧版 RTK、状态读写失败时，仍跳过后置压缩。复合调用要求每条
+新改写命令都有结果；包含既有或无法跟踪的 RTK 命令、无法可靠解析的 Shell 替换时，保守地停用后续处理。
+PowerShell Wrapper 目前不生成回执，保留 RTK 旁路。
+Core 会记录结果查询失败的警告；RTK 侧写入失败保持静默，避免污染工具输出。
+未消费结果一天后过期，后续改写通过索引清理过期记录。
+管线沿用宿主声明的能力。Common Hook、Hermes 和 OpenClaw 在查询结果前已为 RTK 输出声明
+`recovery: none`，因此回退仅接受无损候选；本次修改不会为这些调用启用 Stash/retrieve 恢复。
+继续 PostTool 不保证产生压缩：候选结果仍须通过原有保真与收益检查。
 
 搜索路径共享默认开启。CLI 可通过 `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0` 关闭；
 未设置或为空时保持开启，`1`、`true`、`yes`（不区分大小写）也表示开启；其他值均关闭。

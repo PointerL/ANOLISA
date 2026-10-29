@@ -45,7 +45,11 @@ CLI command and integration capability surface through Rust implementations.
 
 ## V2 SkillSec and Policy CLI
 
-The Rust V2 core adds **SkillSec** behind the existing `skill-ledger` command: local scanners,
+Use `agent-sec-cli skillsec status` or `agent-sec-cli skillsec --help`. The previous
+`skill-ledger` command remains a compatibility alias with identical behavior. Existing Hook
+capability IDs, environment variables and stored data are unchanged.
+
+The Rust V2 core exposes **SkillSec** through `agent-sec-cli skillsec`: local scanners,
 system-key signing, version history, decisions, rollback and SkillFS activation share one root
 daemon. All local users may manage all Skills within the enabled defaults, administrator-configured
 directories or authenticated SkillFS mounts. Default system directories and standard Skill directories
@@ -86,6 +90,10 @@ PolicyTemplates are reusable policies with general rules; the AgentSight Adapter
 currently executes only file-deletion block rules. Scopes save immutable Policy snapshots and
 own automatic Binding creation, reconciliation and cleanup. To authorize non-root Policy CLI callers, configure
 the daemon with `--policy-admin-uid <UID>`; default authorization remains root-only.
+
+**Breaking change:** `scope create --cgroup-id` has been removed because cgroup
+assignments were not supported. Update scripts to select the intended processes
+with `--pid`, `--process-name`, or `--executable`.
 
 V2 uses native OTel for local log correlation only; it exposes no OTLP exporter.
 Pass Agent attribution through the existing `--trace-context` JSON option, or an
@@ -384,7 +392,7 @@ agent-sec-cli scan-pii --input ./sample.log --include-low-confidence
 
 V2 loads custom business rules from `/etc/agent-sec/pii-checker/rules.yaml` at daemon startup;
 `agent-sec-daemon --pii-rules /absolute/path/rules.yaml` selects an alternative. Restart to update.
-V1 retains `~/.config/agent-sec/pii-checker/rules.yaml`. V2 reports coverage, rule identity and `summary.scanner_version: "2.0.0"`;
+V1 retains `~/.config/agent-sec/pii-checker/rules.yaml`. V2 reports coverage, rule identity and `summary.scanner_version: "2.1.1"`;
 a `pass` result with partial coverage does not establish complete detection. This phase preserves
 Hook contracts without switching live hosts or adding PDP enforcement.
 The shared CLI `--trace-context` adapter propagates attribution through the top-level OTel
@@ -394,6 +402,9 @@ OpenClaw records model-entry scans as `source=model_input` on stable `>=2026.5.1
 this input hook scans only the current `prompt`, excluding system prompts and history.
 Older supported hosts retain inbound scanning. Input blocking depends on policy,
 and tool-output hooks remain observation-only.
+
+Fixture words such as `test` lower confidence only when matched as whole words.
+`latest 13812345678` retains its phone finding; `test-only` keeps its existing fixture treatment.
 
 Details: [PII Checker User Guide](../../docs/user-guide/en/agent-sec-core/pii-checker.md).
 

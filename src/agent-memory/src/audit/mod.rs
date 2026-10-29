@@ -79,6 +79,105 @@ impl AuditEntry {
     }
 }
 
+/// Every mode prefix [`sanitized_query_path`] is called with: the `match mode`
+/// arms in `tools::memory_search`, the embedding-failure path (`embed`), and
+/// the two BM25 fallback spellings built by [`fallback_query_mode`].
+///
+/// [`is_sanitized_query_path`] accepts markers built from this list and nothing
+/// else, so a new search mode has to be added here too — otherwise its markers
+/// get mined as queries again, which is the bug this module exists to prevent.
+pub const SANITIZED_QUERY_MODES: &[&str] = &[
+    "bm25",
+    "vector",
+    "hybrid",
+    "embed",
+    "bm25(fallback from vector)",
+    "bm25(fallback from hybrid)",
+];
+
+/// Mode prefix `memory_search` writes when a `vector`/`hybrid` request degrades
+/// to BM25. Shared by the writer and by [`SANITIZED_QUERY_MODES`] so the
+/// spelling cannot drift apart.
+pub fn fallback_query_mode(mode: &str) -> String {
+    format!("bm25(fallback from {mode})")
+}
+
+/// Sanitized `memory_search` audit path: `<mode>:len=<query bytes>`.
+///
+/// Search queries are free-form agent text, so `memory_search` never writes
+/// them to the audit log — it writes the query's byte length behind a mode
+/// prefix instead. Readers that mine queries back out of the log
+/// (`consolidation::heuristics`, `tools::user_profile`) must recognize the
+/// marker and skip it: the query is unrecoverable, and persisting `len=14` as
+/// an "interest" writes junk facts that search then serves back forever.
+///
+/// Writer and readers share these helpers so the marker spelling cannot
+/// drift apart again — it already did once, when the readers were left parsing
+/// the pre-sanitization `mode:query` form.
+pub fn sanitized_query_path(mode: &str, query: &str) -> String {
+    format!("{mode}:len={}", query.len())
+}
+
+/// True when `path` is a [`sanitized_query_path`] marker rather than a mount
+/// path or a recorded query: it is exactly `<mode>:len=<digits>` for one of the
+/// [`SANITIZED_QUERY_MODES`] the writer emits.
+///
+/// Requiring the mode prefix — instead of splitting on the last `:` and looking
+/// at the tail alone — is what keeps legacy rows readable. Rows written before
+/// sanitization landed recorded the query itself, and a query may contain
+/// colons: `bm25:packet:len=14` recorded `packet:len=14`. No supported mode is
+/// spelled `bm25:packet`, so that row is evidence, not a marker; classifying it
+/// as one silently dropped historical queries from interest and profile
+/// synthesis. A path with no mode prefix at all (a bare `len=14`, a mount path)
+/// is not a marker either — the writer always prefixes one.
+pub fn is_sanitized_query_path(path: &str) -> bool {
+    SANITIZED_QUERY_MODES.iter().any(|mode| {
+        let Some(tail) = path
+            .strip_prefix(mode)
+            .and_then(|rest| rest.strip_prefix(':'))
+        else {
+            return false;
+        };
+        is_query_length_marker(tail)
+    })
+}
+
+/// True for the `len=<digits>` half of a marker. A bare `len=` carries no
+/// length, so it is not a marker: a query really spelled `len=` still reaches
+/// the readers untouched.
+fn is_query_length_marker(tail: &str) -> bool {
+    match tail.strip_prefix("len=") {
+        None | Some("") => false,
+        Some(digits) => digits.bytes().all(|b| b.is_ascii_digit()),
+    }
+}
+
+/// The audit `path` in the form persisted memory may quote it.
+///
+/// Episode extraction copies a record's `path` into the facts it writes, and
+/// FactWriter puts those under `facts/` where the index picks them up: whatever
+/// is quoted becomes searchable memory content. For `memory_search` that field
+/// is a [`sanitized_query_path`] marker, and its `len=<N>` half describes the
+/// audit record rather than the call. Quoting it verbatim wrote `bm25:len=14`
+/// into an episodic fact at confidence 0.9 — above the 0.8 that
+/// `memory_session_context` injects into every later prompt. The mode does
+/// describe the call, so that is what survives here.
+///
+/// Every other record is quoted as it stands: `mem_grep`'s directory, a
+/// `mem_promote` pair and a legacy row that really does carry a query are the
+/// call's own input, not a marker. Marker detection is
+/// [`is_sanitized_query_path`] — the predicate the writer and the
+/// consolidation rules already share — so this reader cannot drift from them.
+pub fn quotable_path<'a>(tool: &str, path: &'a str) -> &'a str {
+    if tool != "memory_search" || !is_sanitized_query_path(path) {
+        return path;
+    }
+    match path.split_once(':') {
+        Some((mode, _marker)) => mode,
+        None => path,
+    }
+}
+
 /// Append-only JSONL logger with a held file handle.
 ///
 /// Each `log()` call writes to a persistent `File` handle guarded by a
@@ -138,68 +237,6 @@ impl AuditLogger {
     }
 }
 
-/// Shortest query worth reporting, in bytes.
-const MIN_QUERY_BYTES: usize = 3;
-
-/// The query text a search audit record carries — `None` when it carries none.
-///
-/// `memory_search` puts `<mode>:<payload>` in `path`, and the payload has been
-/// `len=<N>` ever since a89dbc3bf ("audit_log sanitization") kept query text
-/// out of the audit log, which is also fanned out to systemd-journald. That
-/// marker is not a query. Reading it as one made consolidation write a
-/// `搜索: len=NN` fact into `facts/interest/` for every search of every session
-/// and made `mem_dream` report "interested in: len=14". `mem_grep` logs the
-/// directory it walked, which is not a query either.
-///
-/// Any other payload is returned as the query, so a record that does carry one
-/// — the pre-sanitization shape, or a future caller that logs one — keeps
-/// working. Both consumers of the field (the consolidation interest rule and
-/// the profile synthesis) read it through here, so the format has one reader;
-/// `tests/tier_b_test.rs` pins that reader to what `memory_search` really
-/// writes.
-pub fn search_query(tool: &str, path: &str) -> Option<String> {
-    if tool != "memory_search" {
-        return None;
-    }
-    let payload = path.split_once(':')?.1.trim();
-    if is_length_marker(payload) {
-        return None;
-    }
-    (payload.len() > MIN_QUERY_BYTES).then(|| payload.to_string())
-}
-
-/// The audit `path` in the form persisted memory may quote it.
-///
-/// Episodes and the lesson rule copy a record's `path` into facts, and
-/// FactWriter puts those under `facts/` where the index picks them up: whatever
-/// is quoted becomes searchable memory content. For `memory_search` the field is
-/// `<mode>:len=<N>`, and the length marker describes the audit record rather
-/// than the call. Quoting it verbatim wrote `bm25:len=14` into an episodic fact
-/// at confidence 0.9 — above the 0.8 `memory_session_context` injects into every
-/// later prompt — and into the lesson fact of a failed embedding. The mode does
-/// describe the call, so that is what survives here.
-///
-/// Every other record is quoted as it stands: `mem_grep`'s directory, a
-/// `mem_promote` pair and a payload that really is a query are the call's own
-/// input, not a marker.
-pub fn quotable_path<'a>(tool: &str, path: &'a str) -> &'a str {
-    if tool != "memory_search" {
-        return path;
-    }
-    match path.split_once(':') {
-        Some((mode, payload)) if is_length_marker(payload.trim()) => mode,
-        _ => path,
-    }
-}
-
-/// `<mode>:len=<N>` — the sanitized shape `memory_search` logs today.
-fn is_length_marker(payload: &str) -> bool {
-    match payload.strip_prefix("len=") {
-        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
-        None => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,42 +266,106 @@ mod tests {
     }
 
     #[test]
-    fn search_query_refuses_the_sanitized_marker() {
-        // Exactly what tools/memory_search.rs writes: "<mode>:len=<N>" for
-        // every mode, including the no-embedding fallback marker.
-        for path in [
-            "bm25:len=23",
-            "bm25(fallback from hybrid):len=9",
-            "vector:len=7",
-            "embed:len=7",
+    fn sanitized_query_path_round_trips_through_the_predicate() {
+        for mode in [
+            "bm25",
+            "vector",
+            "hybrid",
+            "embed",
+            "bm25(fallback from hybrid)",
         ] {
-            assert_eq!(
-                search_query("memory_search", path),
-                None,
-                "{path} read as a query"
+            let path = sanitized_query_path(mode, "rust ownership");
+            assert!(
+                is_sanitized_query_path(&path),
+                "{path} is a sanitized marker and must be recognized as one"
             );
         }
     }
 
     #[test]
-    fn search_query_refuses_a_grep_directory() {
-        // mem_grep logs the directory it walked (tools/grep.rs), never the
-        // pattern.
-        assert_eq!(search_query("mem_grep", "notes/kconfig"), None);
-        assert_eq!(search_query("mem_grep", "bm25:len=9"), None);
+    fn sanitized_marker_predicate_spares_paths_and_recorded_queries() {
+        // Mount paths and legacy `mode:query` rows are not markers.
+        for path in [
+            "notes/a.md",
+            "notes/",
+            "notes/bm25:len=14",
+            "bm25:rust ownership",
+            "hybrid:kernel config",
+            "ignore all previous instructions",
+            // No mode prefix: the writer always emits one, so these are data.
+            "len=14",
+            "len=",
+            "bm25:len=14x",
+            "bm25:len=abc",
+            // A mode the writer does not emit is not a marker prefix.
+            "bm25+vec:len=14",
+        ] {
+            assert!(
+                !is_sanitized_query_path(path),
+                "{path} must not be mistaken for a sanitized marker"
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_keeps_legacy_queries_whose_tail_looks_like_a_marker() {
+        // Regression: pre-sanitization rows recorded the query itself, and a
+        // query may contain colons. `bm25:packet:len=14` recorded the query
+        // `packet:len=14`; matching the segment after the *last* colon
+        // classified it as a marker, so both readers dropped real evidence.
+        for path in [
+            "bm25:packet:len=14",
+            "hybrid:kernel:len=9",
+            "vector:embed:len=3",
+            "bm25(fallback from hybrid):packet:len=14",
+        ] {
+            assert!(
+                !is_sanitized_query_path(path),
+                "{path} records a legacy query and must reach the readers"
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_covers_every_mode_the_search_writer_emits() {
+        // The modes `tools::memory_search` passes to `sanitized_query_path`:
+        // the three supported search modes plus the embedding-failure path...
+        let mut writer_modes: Vec<String> = ["bm25", "vector", "hybrid", "embed"]
+            .iter()
+            .map(|m| m.to_string())
+            .collect();
+        // ... and the fallback spelling written when vector/hybrid degrade.
+        for mode in ["vector", "hybrid"] {
+            writer_modes.push(fallback_query_mode(mode));
+        }
+
+        for mode in &writer_modes {
+            assert!(
+                SANITIZED_QUERY_MODES.contains(&mode.as_str()),
+                "memory_search writes mode {mode:?}; add it to SANITIZED_QUERY_MODES \
+                 or its markers will be mined as queries"
+            );
+            let path = sanitized_query_path(mode, "rust ownership");
+            assert!(
+                is_sanitized_query_path(&path),
+                "{path} is a sanitized marker and must be recognized as one"
+            );
+        }
     }
 
     #[test]
     fn quotable_path_drops_the_marker_and_keeps_the_mode() {
-        // What tools/memory_search.rs writes, including the no-embedding
-        // fallback marker and the shape a failed embedding logs.
-        assert_eq!(quotable_path("memory_search", "bm25:len=23"), "bm25");
-        assert_eq!(
-            quotable_path("memory_search", "bm25(fallback from hybrid):len=9"),
-            "bm25(fallback from hybrid)"
-        );
-        assert_eq!(quotable_path("memory_search", "embed:len=7"), "embed");
-        // A payload that is not the marker is the record's own text.
+        // Every marker the writer can emit, built through the writer helper so
+        // this reader cannot stay green while the marker spelling moves.
+        for &mode in SANITIZED_QUERY_MODES {
+            let path = sanitized_query_path(mode, "rust ownership");
+            assert_eq!(
+                quotable_path("memory_search", &path),
+                mode,
+                "{path} must be quoted as its mode"
+            );
+        }
+        // A payload that is not a marker is the record's own text.
         assert_eq!(
             quotable_path("memory_search", "bm25:rust ownership rules"),
             "bm25:rust ownership rules"
@@ -288,20 +389,20 @@ mod tests {
     }
 
     #[test]
-    fn search_query_returns_a_payload_that_is_one() {
-        // The pre-sanitization shape, and the shape any future caller that
-        // logs the query itself would produce.
-        assert_eq!(
-            search_query("memory_search", "bm25:rust ownership rules").as_deref(),
-            Some("rust ownership rules")
-        );
-        // Below the minimum length, and with no mode prefix at all.
-        assert_eq!(search_query("memory_search", "bm25:rc"), None);
-        assert_eq!(search_query("memory_search", "notes/kconfig"), None);
-        // "len=" with no digits is a payload, not the marker.
-        assert_eq!(
-            search_query("memory_search", "bm25:len= without a number").as_deref(),
-            Some("len= without a number")
-        );
+    fn quotable_path_keeps_legacy_queries_whose_tail_looks_like_a_marker() {
+        // The regression `is_sanitized_query_path` exists for: this row
+        // recorded the query `packet:len=14`, which is evidence worth quoting
+        // whole rather than a marker to trim down to its mode.
+        for path in [
+            "bm25:packet:len=14",
+            "hybrid:kernel:len=9",
+            "bm25(fallback from hybrid):packet:len=14",
+        ] {
+            assert_eq!(
+                quotable_path("memory_search", path),
+                path,
+                "{path} records a legacy query and must be quoted verbatim"
+            );
+        }
     }
 }

@@ -95,7 +95,7 @@ Add to your MCP config:
 }
 ```
 
-`/usr/share/anolisa/mcp-servers/agent-memory.json` lists all 37 tool names for auto-discovering clients.
+`/usr/share/anolisa/mcp-servers/agent-memory.json` lists tool names for auto-discovering clients.
 
 ### OpenClaw
 
@@ -223,7 +223,7 @@ The plugin passes a minimal env allowlist to the subprocess (`PATH`, `HOME`, `US
 
 ---
 
-## MCP tool set (37 tools)
+## MCP tool set (38 tools)
 
 All tools are invoked via MCP `tools/call` with JSON object arguments. Errors return `CallToolResult { isError: true }` so clients can distinguish business errors from "successful but content contains 'failed'". Profile is enforced at both `tools/list` and `tools/call`.
 
@@ -240,19 +240,56 @@ All tools are invoked via MCP `tools/call` with JSON object arguments. Errors re
 | `mem_diff` | `path1`, `path2` | — | unified diff |
 | `mem_mkdir` | `path` | — | `created <path>` |
 | `mem_remove` | `path` | `recursive` | `removed <path>` |
-| `mem_promote` | `session_path`, `store_path` | — | atomically move session scratch file into the persistent store |
+| `mem_promote` | `session_path`, `store_path` | — | copy session scratch file into a new persistent-store file |
 | `mem_session_log` | — | — | current session JSONL |
 
-### Tier B — structured retrieval (6)
+`mem_write(overwrite=false)` and `mem_promote` refuse existing destinations. On a
+write failure, they remove the incomplete file they created so the same request
+can be retried; a cleanup failure is reported alongside the write error. This is
+not atomic publication: concurrent readers can see a write in progress, and a
+process crash can leave a partial file. Serialize external replacements of the
+same destination against these operations.
+
+`mem_edit` and `mem_write` with `overwrite=true` prepare a complete
+replacement for an existing regular file before publishing it. A write failure
+before publication leaves the original content intact. New files retain normal
+exclusive-create behavior and their destination parent's default ACL and group.
+
+Replacement requires readable/writable destination and metadata directories on
+the same filesystem, Linux procfs, and enough free space for the complete new
+content. Temporary files stay under `.anolisa/`, outside ordinary listings,
+searches, Git history and snapshots. File mode, POSIX access ACLs and `user.*`
+attributes must be preserved; failures abort before replacement. Owner and group
+are preserved when permitted; otherwise a warning records that writer ownership
+or the staging group is retained. Changed ownership can change owner/group-based
+access. Host-managed labels and integrity signatures
+are not copied: the replacement uses host defaults, so custom SELinux/IMA/EVM
+policies require host-specific validation. Set-ID bits and file capabilities are
+not retained. Other hard links and already-open handles keep the old content.
+An error saying the replacement was published but directory sync failed means
+new content is already visible; read the file before retrying.
+
+`mem_edit` requires exactly one occurrence of `old_str`, including overlapping occurrences. For example, `aba` occurs twice in `ababa`; the edit fails and leaves the file unchanged. Include more surrounding text to identify the intended occurrence.
+
+### Tier B — structured retrieval (7)
+
+For keyword search, pass ordinary text to `memory_search`, for example
+`{"query":"config.toml","mode":"bm25"}`. Dotted filenames, domains, and version
+numbers remain searchable terms. `AND`, `NOT`, and `OR` are literal words:
+searching `NOT NULL` looks for that text. Separate search terms with spaces
+instead of inserting `OR`. Multiple terms first require all terms to match; if none do, the existing fallback can return
+partial matches. Short terms, including two-character CJK words, retain their
+substring-search fallback.
 
 | Tool | Required | Optional | Returns |
 |------|------|------|------|
 | `memory_search` | `query` | `top_k` (default 5), `mode` (bm25/vector/hybrid), `category` | `{path, score, snippet, suspicious}` array |
 | `memory_observe` | `content` | `hint`, `type` | `observed at notes/observed/<ulid>.md` |
+| `memory_capture` | `content` | `hint`, `type` | observation path, or `automatic capture skipped by consent` |
 | `memory_get_context` | — | `max_tokens` (default 2048) | markdown preview of recently modified files; each entry has `suspicious` |
 | `memory_sessions` | — | `limit` (default 10) | historical session list |
 | `memory_timeline` | `session_id` | `limit` (default 50) | tool-call timeline for a specific session |
-| `mem_index_refresh` | — | — | force-rebuild the FTS5 index |
+| `mem_index_refresh` | — | — | refresh the MEMORY.md directory index |
 
 ### Tier C — governance & versioning (7)
 
@@ -262,9 +299,17 @@ All tools are invoked via MCP `tools/call` with JSON object arguments. Errors re
 | `mem_snapshot_list` | — | — | array sorted by `created_at` |
 | `mem_snapshot_restore` | `id` | — | `restored <id>` |
 | `mem_log` | — | `limit` (default 20), `path` | `{hash, summary, author, time}` array (requires git) |
-| `mem_revert` | `path` | — | `reverted <path> (commit <hash>)` (requires git) |
+| `mem_revert` | `path` | — | `reverted <path> (from commit <hash>)` (requires git) |
 | `mem_consolidate` | — | — | `consolidation complete: N facts written` |
 | `mem_compact` | — | — | `compacted N files to cold storage` |
+
+`mem_revert` restores only the requested file's working-tree content from HEAD. It leaves Git history and the index unchanged, including any staged changes to that file, and returns the source HEAD hash. A later manual commit without restaging can therefore commit the pre-restore index contents; stage the restored file explicitly if that is what you intend to commit. Other files remain available for separate undo operations. This applies with either value of `memory.git.auto_commit`; ordinary write tools retain their existing auto-commit behavior.
+
+Snapshot restore preserves read-only directory modes. Disposable extraction
+staging is cleaned after a failed attempt and before a retry. The previous live
+tree remains recoverable under `.anolisa/trash/` with its original modes;
+manual purging of read-only directories may require restoring owner write
+permission first. Restore does not automatically collect retained trash.
 
 ### Sovereignty & import/export (13)
 
@@ -283,6 +328,51 @@ All tools are invoked via MCP `tools/call` with JSON object arguments. Errors re
 | `memory_summary` | — | `recent_limit` (default 10) | memory store statistics overview JSON |
 | `memory_session_context` | — | `limit` | session-start context injection |
 | `mem_dream` | — | — | user profile synthesis JSON |
+
+`memory_consent` with `{"action":"deny","scope":"capture"}` (or scope `all`)
+stops automatic OpenClaw observations. The hook uses `memory_capture`, which reads
+the persisted consent on each call, including changes made by another MCP client.
+Missing settings retain the default allow policy; unreadable or malformed settings
+report an error without writing. Allowed captures carry `source: auto-capture`
+and appear in `memory_auto_created` and the automatic count in `memory_summary`.
+Revocation applies to subsequent captures; it does not abort a capture that has
+already passed its consent check. This opt-out governs the hook, not all writes:
+`memory_observe` and `mem_write` remain ungated, including when an agent calls
+them on its own initiative. A denied or failed attempt can be retried by a later
+hook invocation; successful captures and overlapping identical calls remain
+deduplicated.
+
+The source field identifies automatic notes; audit entries and git commit labels
+still use `memory_observe` to preserve existing versioning and consolidation
+behavior. The existing consent query and consolidation reader keep their prior
+policies: malformed settings can be reported as default allow by the query even
+though automatic capture rejects them. For a malformed regular settings file,
+repair it with an explicit `memory_consent` allow/deny operation. If the
+settings path is a symlink, safe writes reject it too: inspect and remove the
+link itself (not its target), then repeat the allow/deny operation to create
+a regular settings file. The server does not remove symlinks automatically.
+
+Upgrade the server and adapter together. The four tools exposed to the OpenClaw
+agent remain unchanged; `memory_capture` is used by the hook. If the server lacks
+this tool, the hook logs the failure and does not fall back to `memory_observe`.
+Previously stored observations are not relabeled or deleted.
+
+`memory_summary` counts the `concepts` and `files` frontmatter lists in
+`top_concepts` and `top_files`. It accepts JSON string arrays and the block lists
+written by `mem_import`, so these rankings survive an AMA export/import round trip.
+For example, `concepts: ["parser, writer", "rust"]` contains two concepts, and
+`files: ["src/a,b.rs"]` contains one file reference. Commas, quotes and backslashes
+inside each single-line JSON string remain part of that entry.
+
+Import replaces ASCII control characters, including newlines, with spaces
+before storing frontmatter. Summary rankings reflect those normalized entries;
+control characters are not preserved by an AMA import round trip.
+
+A missing store root is an export error, not an empty archive. Scan and read failures include the affected mount-relative path and are audited best-effort; an unavailable store can also prevent audit persistence.
+
+`mem_export` stops with an error naming the affected path if it cannot scan a directory or read a Markdown file as UTF-8. It does not return a partial AMA archive as a successful export. Check file permissions or encoding and retry. Category and source filters require reading metadata, so a read failure can also block a filtered export. Metadata directories and non-Markdown files remain excluded.
+
+Rust API callers using `ExportFilter.include_tasks = false` exclude the `tasks/` subtree before traversal or reading, so unreadable task directories or files do not block the requested export. The MCP `mem_export` tool includes tasks and retains error reporting for them.
 
 ### Error code semantics
 
@@ -373,7 +463,7 @@ BM25 + dense vector hybrid retrieval, fused via RRF (Reciprocal Rank Fusion, k=6
 | Provider | Configuration | Notes |
 |----------|---------|------|
 | OpenAI | `MEMORY_EMBEDDING_BACKEND=openai` + `OPENAI_API_KEY` | calls OpenAI Embeddings API |
-| Ollama | `MEMORY_EMBEDDING_BACKEND=ollama` + `OLLAMA_BASE_URL` | local Ollama instance |
+| Ollama | `MEMORY_EMBEDDING_BACKEND=ollama` + `MEMORY_OLLAMA_BASE_URL` | local Ollama instance |
 
 `memory_search` supports `mode`: `bm25` (default) / `vector` (cosine similarity) / `hybrid` (RRF fusion). Without embedding config, `vector`/`hybrid` auto-degrade to BM25 — no error.
 
@@ -466,7 +556,7 @@ Every config key has a matching `MEMORY_*` env var. Priority: **env > config.tom
 | `MEMORY_MAX_WRITE_BYTES` | per-write cap | 16 MiB |
 | `MEMORY_MAX_APPEND_BYTES` | per-append cap | 4 MiB |
 | `MEMORY_INDEX_ENABLED` | enable FTS5 index | true |
-| `MEMORY_INDEX_TIME_DECAY_LAMBDA` | time decay (≥0) | 0.01 |
+| `MEMORY_INDEX_TIME_DECAY_LAMBDA` | time decay (finite, ≥0) | 0.01 |
 | `MEMORY_INDEX_TIME_DECAY_ALPHA` | time weight ratio (0–1) | 0.3 |
 | `MEMORY_INDEX_COLD_AFTER_DAYS` | cold archive days | 30 |
 | `MEMORY_INDEX_EXCLUDE_COLD` | exclude cold from search | true |
@@ -478,6 +568,7 @@ Every config key has a matching `MEMORY_*` env var. Priority: **env > config.tom
 | `MEMORY_EMBEDDING_BACKEND` | embedding backend (none/openai/ollama) | none |
 | `MEMORY_OPENAI_API_KEY` | OpenAI API key (falls back to `OPENAI_API_KEY`) | — |
 | `MEMORY_OPENAI_MODEL` | OpenAI embedding model | text-embedding-3-small |
+| `MEMORY_OPENAI_BASE_URL` | OpenAI-compatible base URL | https://api.openai.com |
 | `MEMORY_OLLAMA_MODEL` | Ollama embedding model | nomic-embed-text |
 | `MEMORY_OLLAMA_BASE_URL` | Ollama base URL | http://localhost:11434 |
 | `MEMORY_CONSOLIDATION_ENABLED` | enable auto consolidation | true |
@@ -495,9 +586,9 @@ Data storage: `~/.anolisa/memory/<namespace>/`.
 
 Profiles are UX hints, not security boundaries, but enforced at both `tools/list` and `tools/call`:
 
-- **basic** — all 37 tools shown; weaker models can use the Tier B structured API.
-- **advanced** (default) — all 37 tools shown; stronger models should prefer Tier A file ops.
-- **expert** — hides Tier B (`memory_search`, `memory_observe`, `memory_get_context`, `mem_consolidate`, `memory_forget`, `memory_consent`); `tools/call` returns `METHOD_NOT_FOUND`. For proficient models that only need Tier A and Tier C.
+- **basic** — all 38 tools shown; weaker models can use the Tier B structured API.
+- **advanced** (default) — all 38 tools shown; stronger models should prefer Tier A file ops.
+- **expert** — hides Tier B (`memory_search`, `memory_observe`, `memory_capture`, `memory_get_context`, `mem_consolidate`, `memory_forget`, `memory_consent`); `tools/call` returns `METHOD_NOT_FOUND`. For proficient models that only need Tier A and Tier C.
 
 `expert` is a setting for direct MCP clients, which drive the Tier A file tools
 themselves. The OpenClaw adapter rejects
@@ -511,6 +602,36 @@ leave the memory slot loaded while every one of those calls came back
 `METHOD_NOT_FOUND`, so the adapter fails at boot and says why instead.
 
 ### Embedding config
+
+When `backend` is selected in TOML, leave `MEMORY_EMBEDDING_BACKEND` unset
+to retain that provider's file settings. Its `MEMORY_OPENAI_*` or
+`MEMORY_OLLAMA_*` variables override only the fields supplied; for example,
+`MEMORY_OPENAI_API_KEY` supplies the key without repeating the backend selector.
+Direct server use still falls back to `OPENAI_API_KEY` when the effective key is
+empty; the OpenClaw adapter forwards the prefixed variable, not that generic one.
+Setting `MEMORY_EMBEDDING_BACKEND` explicitly retains its existing behavior:
+provider fields come from environment variables or provider defaults, rather
+than inheriting TOML values. Field variables alone do not activate a backend
+configured as `none`.
+
+Unset means the variable is absent: remove `MEMORY_EMBEDDING_BACKEND` from the
+environment rather than setting it to `""`. An empty or unknown selector keeps
+the TOML configuration and ignores provider field overrides. Empty field values
+are supplied overrides and replace the corresponding TOML values. In particular,
+`MEMORY_OPENAI_API_KEY=""` clears a file key, then uses the generic-key fallback
+or leaves embedding disabled. An empty model name can cause request failures.
+`MEMORY_OPENAI_BASE_URL=""` selects the public `https://api.openai.com` default,
+not the TOML endpoint, so requests use that public endpoint instead of a
+file-configured proxy. `MEMORY_OLLAMA_BASE_URL=""` leaves the endpoint empty and
+requests fail URL construction. Remove a field variable to keep its file value.
+
+Keep a populated index on the model that produced its vectors until you have a
+controlled re-embedding plan; different models can have incompatible semantics
+even with equal dimensions. Restarting does not re-embed existing vectors, and
+`mem_index_refresh` only refreshes the `MEMORY.md` directory index. The proposed
+[dimension-change recovery](https://github.com/agentic-os-org/ANOLISA/pull/4077)
+is tracked separately and is not implemented by this configuration fix. Restoring
+the old model setting does not undo vectors already produced with a new model.
 
 ```toml
 [memory.embedding]
@@ -527,7 +648,7 @@ model = "text-embedding-3-small"
 - Cross-session persistence of notes and decisions (Claude Code, Cursor, Continue, custom rmcp clients).
 - Multi-agent systems where Agent A writes and Agent B reads shared notes.
 - Operation audit and state recovery (`mem_log`, JSONL audit, journald, `mem_revert`, `mem_snapshot_restore`).
-- Multi-turn "draft first, persist when decided" pattern (`mem_promote` atomically moves files from session scratch into the persistent store).
+- Multi-turn "draft first, persist when decided" pattern (`mem_promote` copies files from session scratch into the persistent store).
 
 ---
 
@@ -594,7 +715,7 @@ let tools = client.list_tools(Default::default()).await?;
 
 1. Set `MEMORY_SESSION_ID=<sid>` and `MEMORY_SESSION_DIR=/run/anolisa/sessions` for each agent run.
 2. Agent writes drafts to `/run/anolisa/sessions/<sid>/scratch/`.
-3. When a draft is worth keeping, the agent calls `mem_promote` to atomically move it into the persistent store.
+3. When a draft is worth keeping, the agent calls `mem_promote` to copy it into the persistent store, retaining the scratch original.
 
 ---
 

@@ -40,14 +40,14 @@ retrieval, and attribution.
 |---|---|---|
 | Schema compression | 47.3% on reference fixture | Compresses OpenAI Function Calling tool schemas |
 | Content-aware response compression | workload-dependent | Routes successful JSON through `JsonCompressor`; complete candidates retain all fields and empty values; those saving at least 15% take priority, while recoverable record arrays can be reduced to a 32-record base budget |
-| Build-log compression | workload-dependent | Cleans terminal control output and reduces repeated routine progress in recognized Cargo, pytest, npm/Jest, Go, Make/C, and generic command logs while preserving diagnostics, summaries, phases, and stack traces |
+| Build-log compression | workload-dependent | Cleans terminal control output and reduces repeated routine progress in recognized Cargo, pytest, unittest/Django, npm/Jest, Go, Make/C, and generic command logs while preserving diagnostics, summaries, phases, and stack traces |
 | Search path sharing | workload-dependent | Enabled by default: API search records share consecutive paths; pure path lists from commands or APIs share a directory prefix, retaining every received path and byte. File reads skip the path-list strategy. Disable with `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0` or SDK `search_path_sharing_enabled=False` |
 | Git Diff context cropping | workload-dependent | Opt in with `TOKENLESS_DIFF_COMPRESSION_ENABLED=1` or SDK `diff_compression_enabled=True`; preserves all changed lines, reduces context per hunk, and provides original recovery. Disabled by default; stable whole-Agent token savings have not been established |
 | HTML page rendering | workload-dependent | Enabled by default: renders complete HTML documents from commands or APIs as Markdown, removes only enumerated non-content elements (scripts, styles, navigation, banners, footers, asides, form controls, media embeds) with counts in the view header, and provides original recovery; disable with `TOKENLESS_HTML_EXTRACTION_ENABLED=0` or SDK `html_extraction_enabled=False`; file reads pass through |
 | CSV/TSV table compression | workload-dependent | Preserves every cell and row/column order while compacting quoting and record separators; returns the original when there is no benefit. No row sampling or Stash writes. Requires a text replacement slot; file reads pass through |
 | Reversible compression (stash) | — | Omitted record collections and bounded values are stashed; supported agents run `tokenless retrieve HASH` or call their static Retrieve Tool when full data is needed |
-| TOON context compression | 17.0% on reference response | Encodes JSON to TOON format for LLMs |
-| Command rewriting | 60–90% | Filters CLI output via RTK (70+ commands supported); recognized build/test commands and direct or built-in-wrapper `find` invocations keep the entire command native, even when search path sharing is disabled; custom RTK wrapper prefixes are outside this protection |
+| TOON context compression | 17.6% on reference response | Encodes JSON to TOON format for LLMs; since TOON spec v4.4 this also covers nested record arrays and objects keyed by ID, which previously encoded larger than compact JSON |
+| Command rewriting | 60–90% | Filters CLI output via RTK (70+ commands supported); recognized build/test commands and direct or built-in-wrapper `find`, `head`, and `tail` invocations keep the entire command native, even when search path sharing is disabled; custom RTK wrapper prefixes are outside this protection |
 | Tool Ready | reduces retry waste | Legacy pre-call check, auto-fix, and blocking; hard-disabled |
 | OpenClaw plugin | — | RTK ✅, lossless live PostTool ✅, Schema/Retrieve unavailable in the host |
 | copilot-shell hooks | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅; Cosh-NG supports response compression and Marker-command recovery, while legacy copilot-shell remains lossless-only; Common BeforeModel passes schemas through without authorized Retrieve |
@@ -221,14 +221,11 @@ resources, framework registrations and npm package are left alone. A replacement
 that fails halfway (a missing tag, a build error) puts the previous install back
 instead of leaving the machine without a CLI.
 
-Published packages cover Linux x86_64/aarch64 and macOS Apple Silicon. Intel
-macOS still has no published package: the `@anolisa/tokenless-darwin-x64`
-optional-dependency entry describes a release build target, not a registry
-artifact, so the npm route cannot deliver a binary there. The standalone
-installer does not fall back to a source build on macOS either — it exits with
-an error instead of running `cargo` — so Intel macOS currently has no supported
-install route. Use Linux or Apple Silicon macOS until that package is
-published.
+Published npm packages cover Linux x86_64/aarch64, macOS Apple Silicon and
+Intel Mac, and Windows x64. The `@anolisa/tokenless-darwin-x64` and
+`@anolisa/tokenless-win32-x64` packages are available from 0.9.0. The standalone
+installer uses npm on macOS and refuses a source-build fallback there: it
+exits with an error instead of running `cargo`. On Windows, use npm directly.
 
 ANOLISA-managed and adopted RPM installations place the available adapters
 without changing an Agent product's user configuration. Run these commands
@@ -285,9 +282,9 @@ where its native wheel was built. It exposes the four Tokenless lifecycle
 methods and bundles the matching RTK executable; TOON is linked into the native
 runtime. It does not require the Tokenless CLI or system helper binaries. The
 package is built and tested in this repository but is not yet published to
-PyPI. See the [Python SDK guide](../../docs/user-guide/en/tokenless/sdk.md) for
+PyPI. See the [Python SDK guide](../../docs/developer-guide/en/sdk/tokenless/index.md) for
 runnable lifecycle and Stats examples, the
-[AgentScope SDK integration](../../docs/user-guide/en/tokenless/sdk/agentscope.md) for
+[AgentScope SDK integration](../../docs/developer-guide/en/sdk/tokenless/agentscope.md) for
 AgentScope attachment, the
 [Agent integration guide](../../docs/user-guide/en/tokenless/framework-integration.md)
 for product adapters, and the [runtime design](docs/design/runtime-library.md) for internal contracts.
@@ -333,8 +330,9 @@ original output while Core attaches environment-diagnostic context.
 
 PreTool leaves recognized Cargo, pytest, npm/Jest, Go, and Make build/test
 commands unchanged so their native output has a single PostTool owner. Other
-supported commands may be rewritten by RTK, and their results continue to
-bypass PostTool compression.
+supported commands may be rewritten by RTK. Successful results enter PostTool only
+when complete execution receipts confirm unchanged output and PostTool supplies the exact
+registered execution command, preserving the original command's file-origin guards.
 
 Claude Code 2.1.121 or newer, Qoder CLI, OpenCode, and Cosh-NG can replace the
 live result. Their PostTool requests enable recovery when bare `tokenless`
@@ -413,7 +411,10 @@ tokenless retrieve '<<tokenless:c30ccf5ed1125e0ed871ba8e>>'
 
 Encode JSON to TOON format (or decode back to JSON). Payloads shorter than
 500 characters pass through unchanged by default (the same minimum the
-adapter hooks apply); use `--min-toon-chars 0` to encode them anyway:
+adapter hooks apply); use `--min-toon-chars 0` to encode them anyway. A
+payload holding a number TOON cannot carry exactly — `1e-400`, `-0.0`,
+`1e3`, or a decimal longer than an `f64` — passes through unchanged too,
+which is the same guard the automatic PostTool path applies:
 
 ```bash
 # Encode JSON to TOON (short payload, gate disabled for this call)
@@ -589,7 +590,10 @@ The plugin translates OpenClaw tool hooks and live result middleware into Protoc
 
 Core owns RTK execution, JSON detection, compaction, TOON selection, thresholds, diagnostics, and final
 arbitration. The plugin carries Core's per-call `output_optimization` from PreTool into the matching
-PostTool request, so RTK output is not compressed twice. The local CLI recovery command is a trusted
+PostTool request. Core resumes processing only when complete execution receipts confirm unchanged
+output and PostTool supplies the exact registered execution command, restoring the original command
+for file-origin checks; changed or unconfirmed output bypasses
+compression. The local CLI recovery command is a trusted
 operator entry rather than Agent authorization, so the plugin applies only lossless candidates.
 
 The plugin declares `contracts.agentToolResultMiddleware: ["openclaw"]` and must be explicitly
@@ -691,6 +695,20 @@ compression so the recovered payload reaches the model unchanged.
 make qoder-install
 ```
 
+## QwenWork Plugin (Windows x64 Local Mode)
+
+Windows x64 supports native `tokenless.exe` and `rtk.exe`, npm launchers, and
+QwenWorkCN PowerShell hooks. Windows ARM64 is unsupported. Install the published
+package with `npm install -g anolisa-tokenless`. For source builds, follow the
+[Windows build instructions](../../docs/developer-guide/en/tokenless/windows.md#build-and-test-on-windows).
+Git Bash and WSL are not required.
+
+The Python adapter registers PowerShell hook commands and handles both Bash and
+PowerShell PreTool inputs. RTK decides which commands can be rewritten;
+unsupported commands pass through. PowerShell PostTool output uses the shared
+command-output policy, including RTK deduplication and file-content protection.
+See [Windows installation and validation](../../docs/user-guide/en/tokenless/framework-integration.md#qwenwork-windows-x64-local-mode).
+
 ## QwenWork Plugin (macOS)
 
 The `qwenwork` adapter targets QwenWorkCN (千问办公) native Bash and macOS workspace
@@ -699,7 +717,15 @@ Shell sessions. PreToolUse rewrites both shell tool names; PostToolUse observes
 `mcp_list`, `mcp_get`, or `mcp_call` pass through without replacing their real
 output; full MCP responses remain compressible. File-content protection and RTK
 deduplication remain unchanged. Statistics use `qwenwork`, independently of Qoder CLI, Qwen Code,
-and QwenPaw.
+and QwenPaw. QwenWork workspace Shell hooks use the system user's default
+`~/.tokenless` directory or a valid absolute `TOKENLESS_DATA_DIR` for databases
+and Pre/Post state; `$HOME` does not redirect the default. Invalid paths pass
+through without creating state. Existing workspace databases are not migrated.
+Shell sandbox restrictions can prevent RTK statistics and execution receipts
+from being saved while commands and host Hook compression still work.
+Installation/detection reports this limitation and the current process's data
+directory without testing sandbox access. RTK's native database retains
+its own path configuration.
 
 After `anolisa install tokenless`, quit QwenWorkCN and explicitly sideload the plugin:
 
@@ -712,8 +738,8 @@ anolisa adapter status tokenless
 Restart QwenWorkCN and open a new session; check activation in the application.
 The CLI verifies managed files, while loading and activation remain `unknown`.
 It does not change settings or enable a disabled plugin. Linux VM sessions remain
-unsupported. Workspace Shell state uses the conversation working directory, and
-its single MCP text block is handled as shell output. Uninstall previous
+unsupported. Workspace Shell state follows the Tokenless data directory, and its
+single MCP text block is handled as shell output. Uninstall previous
 script-managed installations with their original script before enabling through
 the CLI; CLI-managed copies use `anolisa adapter disable tokenless qwenwork`.
 Installation, removal, and compatibility baselines are covered in
@@ -1126,7 +1152,7 @@ layout and single-target interface.
 
 ## Prerequisites
 
-- **Rust** toolchain >= 1.89 — required by rtk (edition 2024) and toon-format (is_multiple_of). Install via [rustup](https://rustup.rs)
+- **Rust** toolchain >= 1.89 — required by rtk (edition 2024). Install via [rustup](https://rustup.rs)
 - **just** — build runner for rtk setup (clone + patch orchestration)
 - **Git** — for rtk source download via justfile
 - **CPython 3.11+ development environment and uv** — only for the Python wheel
