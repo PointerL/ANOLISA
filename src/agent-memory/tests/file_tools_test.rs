@@ -307,6 +307,67 @@ fn diff_missing_file_errors() {
 // (promote_copies_scratch_to_store, promote_missing_scratch_file_returns_not_found,
 //  session_log_degrades_gracefully_when_session_dir_unavailable).
 
+#[test]
+fn diff_output_round_trips_as_a_unified_patch() {
+    let (_tmp, svc) = setup();
+    let original = "first\noriginal\nlast\n";
+    let modified = "first\nmodified\nlast\n";
+    svc.write("notes/original.md", original, false).unwrap();
+    svc.write("notes/modified.md", modified, false).unwrap();
+    let output = svc.diff("notes/original.md", "notes/modified.md").unwrap();
+    let patch =
+        diffy::Patch::from_str(&output).expect("mem_diff must return a valid unified patch");
+    assert_eq!(patch.original(), Some("notes/original.md"));
+    assert_eq!(patch.modified(), Some("notes/modified.md"));
+    assert_eq!(diffy::apply(original, &patch).unwrap(), modified);
+}
+
+#[test]
+fn diff_preserves_escaped_relative_filenames() {
+    let (_tmp, svc) = setup();
+    let original_path = "笔记/旧 \"名\"\t行\n.md";
+    let modified_path = "笔记/新\\名\r.md";
+    let original = "keep \\\n\t\r\nold\n";
+    let modified = "keep \\\n\t\r\nnew\n";
+    svc.write(original_path, original, false).unwrap();
+    svc.write(modified_path, modified, false).unwrap();
+    let output = svc.diff(original_path, modified_path).unwrap();
+    let patch = diffy::Patch::from_str(&output).expect("escaped filenames must remain parseable");
+    assert_eq!(patch.original(), Some(original_path));
+    assert_eq!(patch.modified(), Some(modified_path));
+    assert_eq!(diffy::apply(original, &patch).unwrap(), modified);
+}
+
+#[test]
+fn diff_preserves_identical_and_unterminated_contents() {
+    let (_tmp, svc) = setup();
+    for (index, (original, modified)) in [
+        ("same\n", "same\n"),
+        ("before", "after"),
+        ("", "first"),
+        ("second", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let original_path = format!("original-{index}.md");
+        let modified_path = format!("modified-{index}.md");
+        svc.write(&original_path, original, false).unwrap();
+        svc.write(&modified_path, modified, false).unwrap();
+        let output = svc.diff(&original_path, &modified_path).unwrap();
+        let patch = diffy::Patch::from_str(&output)
+            .unwrap_or_else(|error| panic!("case {index}: invalid patch: {error}"));
+        let applied = diffy::apply(original, &patch)
+            .unwrap_or_else(|error| panic!("case {index}: cannot apply patch: {error}"));
+        assert_eq!(applied, modified, "case {index}");
+        assert_eq!(
+            patch.hunks().is_empty(),
+            original == modified,
+            "case {index}"
+        );
+    }
+}
+
 // ---------- audit log smoke ----------
 
 #[test]
@@ -444,5 +505,66 @@ mod symlink_attacks {
         let err = svc.mkdir("out/inside").unwrap_err();
         assert!(matches!(err, MemoryError::PathOutsideMount(_)));
         assert!(!outside.path().join("escape/inside").exists());
+    }
+}
+
+fn setup_edit_overlap() -> (tempfile::TempDir, MemoryService) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.memory.paths.base_dir = tmp.path().join("data").to_string_lossy().into_owned();
+    cfg.memory.session.base_dir = tmp.path().join("sessions").to_string_lossy().into_owned();
+    cfg.memory.mount.strategy = agent_memory::mount::MountStrategyKind::Userland;
+    cfg.memory.index.enabled = false;
+    cfg.memory.git.enabled = false;
+    (tmp, MemoryService::new(cfg).unwrap())
+}
+
+#[test]
+fn overlapping_edits_require_more_context_and_preserve_the_file() {
+    let (_tmp, svc) = setup_edit_overlap();
+    for (body, old) in [
+        ("ababa", "aba"),
+        ("哈哈哈", "哈哈"),
+        ("   code", "  "),
+        ("aaa", "aa"),
+        ("prefix ababa", "aba"),
+        ("前缀哈哈哈", "哈哈"),
+        ("前缀ababa", "aba"),
+    ] {
+        svc.write("note.md", body, true).unwrap();
+        let result = svc.edit("note.md", old, "replacement");
+        assert!(
+            matches!(result, Err(MemoryError::InvalidArgument(ref message))
+            if message.contains("multiple occurrences")),
+            "expected ambiguity for {body:?} / {old:?}, got {result:?}"
+        );
+        assert_eq!(svc.read("note.md").unwrap(), body);
+    }
+}
+
+#[test]
+fn unique_context_and_disjoint_repetition_keep_their_behavior() {
+    let (_tmp, svc) = setup_edit_overlap();
+    svc.write("note.md", "哈哈哈", false).unwrap();
+    svc.edit("note.md", "哈哈哈", "done").unwrap();
+    assert_eq!(svc.read("note.md").unwrap(), "done");
+    svc.write("note.md", "aba aba", true).unwrap();
+    assert!(svc.edit("note.md", "aba", "changed").is_err());
+    assert_eq!(svc.read("note.md").unwrap(), "aba aba");
+    assert!(svc.edit("note.md", "missing", "").is_err());
+}
+
+#[test]
+fn unique_edits_after_multibyte_prefix_and_at_eof() {
+    let (_tmp, svc) = setup_edit_overlap();
+    for (body, old, expected) in [
+        ("prefix aba", "aba", "prefix done"),
+        ("前缀哈哈", "哈哈", "前缀done"),
+        ("前缀aba", "aba", "前缀done"),
+        ("前缀aba tail", "aba", "前缀done tail"),
+    ] {
+        svc.write("note.md", body, true).unwrap();
+        svc.edit("note.md", old, "done").unwrap();
+        assert_eq!(svc.read("note.md").unwrap(), expected);
     }
 }

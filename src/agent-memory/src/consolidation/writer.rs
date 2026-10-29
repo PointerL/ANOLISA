@@ -205,7 +205,11 @@ impl FactWriter {
                      superseded)",
                     candidate.path
                 ),
-                Err(e) => tracing::warn!("failed to supersede '{}': {e}", candidate.path),
+                Err(e) => tracing::warn!(
+                    "failed to supersede '{}' for fact '{}': {e}",
+                    candidate.path,
+                    fact.id
+                ),
             }
         }
     }

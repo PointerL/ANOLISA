@@ -36,6 +36,15 @@ in Rust Core rather than Python configuration. A shell tool's `PostToolRequest` 
 command line in `command`; Core, not the adapter, reports a plain print of local files as
 `file_read` so that a printed HTML page stays verbatim while data in that output still compresses.
 
+PreTool preserves recognized native `head` and `tail` calls using the same direct-call and
+built-in wrapper recognition as `find`, including nesting and shell line continuations. Every
+argument form keeps native execution, including byte windows and follow mode. A recognized call
+keeps its entire pipeline or compound command outside RTK rewriting. This avoids structural
+truncation in RTK's `read --max-lines` path; explicit RTK calls retain their existing behavior.
+Custom `hooks.transparent_prefixes` are not inspected, so calls behind those prefixes may still
+be rewritten. The rule is independent of search path sharing and retains the existing PostTool
+file-read policy.
+
 The SDK never stores a process-global current session. `before_model` returns the exact visible
 marker set. An adapter declares whether it has a marker-authorized recovery path and owns any
 Agent-facing command or tool declaration. AgentScope keeps its Retrieve tool static across model
@@ -43,6 +52,15 @@ calls, retains the marker set in framework session state, and `retrieve` authori
 in that set. Host applications
 retain raw tool values for UI and business logic and pass only copied, final model-visible text to
 `post_tool`. Retrieve output never enters PostTool again.
+
+QwenWork's hook adapter normalizes its two workspace Shell MCP names to `Bash`
+before either lifecycle request. It unwraps only an exact single plain text block;
+unknown block arrays pass through without compression. The workspace event's
+absolute `cwd` anchors `.tokenless` state for both hooks and the RTK command.
+Native Bash keeps the existing state location and structured response handling.
+Plugin-private binaries are resolved by the adapter. Neither that private PATH
+nor workspace state implies model-visible recovery access, so these paths declare
+`recovery.kind = none`.
 
 Invalid inputs, missing packaged RTK, lifecycle operation failures, attachment failures, and
 tool-name collisions fail fast. Normal Core dispositions such as passthrough, no savings, and
@@ -57,7 +75,7 @@ host result; the adapter catches them because the host treats thrown middleware 
 tool failures. Legacy middleware preprocessing can already have clipped text or metadata.
 Tokenless neither rejects such hosts above the API minimum nor reconstructs missing content.
 Only `applied` compression replaces text; tool-error diagnostics may still append context.
-See the [host compatibility boundary](../../../../docs/user-guide/en/token-saving/tokenless/framework-integration.md#openclaw).
+See the [host compatibility boundary](../../../../docs/user-guide/en/tokenless/framework-integration.md#openclaw).
 
 After building the CLI and OpenClaw adapter, run the optional container regression from
 `src/tokenless` with a local host image:
@@ -162,7 +180,30 @@ Unwrapped Grep listings are recorded as `api_response` in statistics, rather tha
 they are filtered tool responses, not authoritative file copies. Historical origin-grouped queries
 therefore have a version boundary. Core treats the exact tool name `Grep` as a search-only tool:
 it cannot enter JSON, table, or log compressors, even when search path sharing is disabled. SDK
-callers should use that name only for this search contract. RTK-owned output still bypasses Core.
+callers should use that name only for this search contract.
+
+RTK ownership is provisional until execution completes. PreTool atomically stores the original and exact executed commands
+and assigns each rewritten RTK invocation a generation and ordinal in `rtk-outcomes.db` under
+the Runtime data directory, independently of statistics collection. Bundled RTK records whether
+it changed any output bytes; a tied or increased token estimate does not prove unchanged output.
+PostTool requires its `command` to match the registered command, including the generation, before
+consuming evidence once per agent/session/tool call. Missing or modified commands retain the bypass,
+so a failed retry registration cannot reuse older receipts. Complete unchanged receipts
+allow a successful result back into the normal pipeline using the saved original command, so
+file-read origin and other command-based guards still apply. A retry with an untrackable rewrite
+attempts to invalidate the previous generation; even if this fails, command matching prevents
+reuse by that retry. Late reports cannot recreate a deleted generation.
+Changed output, missing or expired receipts, old RTK binaries, or state failures retain the RTK
+bypass. Compound calls require receipts for every newly wrapped invocation; existing or
+untracked RTK wrappers and ambiguous shell substitutions conservatively disable fallback.
+PowerShell wrappers currently have no receipts and retain the RTK bypass.
+Receipt lookup failures warn in Core; RTK-side writes fail silently to preserve tool output.
+Abandoned receipts expire after one day and an indexed sweep removes them on a later rewrite.
+The pipeline retains the host's declared capabilities. Common Hooks, Hermes and OpenClaw declare
+`recovery: none` for RTK output before receipt lookup, so their fallback accepts only lossless
+candidates; this change does not enable Stash/retrieve recovery for those calls.
+Continuing PostTool does not guarantee compression: its candidate must still pass normal
+fidelity and savings checks.
 
 ## Statistics queries
 
