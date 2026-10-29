@@ -167,7 +167,9 @@
                     "hermes",
                     "qwenpaw",
                     "pi",
-                    "claude-sdk"
+                    "claude-sdk",
+                    "qoder-sdk",
+                    "agentscope"
                   ]
                 },
                 "binding_id": {
