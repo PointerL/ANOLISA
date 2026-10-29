@@ -47,7 +47,7 @@ retrieval, and attribution.
 | CSV/TSV table compression | workload-dependent | Preserves every cell and row/column order while compacting quoting and record separators; returns the original when there is no benefit. No row sampling or Stash writes. Requires a text replacement slot; file reads pass through |
 | Reversible compression (stash) | — | Omitted record collections and bounded values are stashed; supported agents run `tokenless retrieve HASH` or call their static Retrieve Tool when full data is needed |
 | TOON context compression | 17.6% on reference response | Encodes JSON to TOON format for LLMs; since TOON spec v4.4 this also covers nested record arrays and objects keyed by ID, which previously encoded larger than compact JSON |
-| Command rewriting | 60–90% | Filters CLI output via RTK (70+ commands supported); recognized build/test commands and direct or built-in-wrapper `find` invocations keep the entire command native, even when search path sharing is disabled; custom RTK wrapper prefixes are outside this protection |
+| Command rewriting | 60–90% | Filters CLI output via RTK (70+ commands supported); recognized build/test commands and direct or built-in-wrapper `find`, `head`, and `tail` invocations keep the entire command native, even when search path sharing is disabled; custom RTK wrapper prefixes are outside this protection |
 | Tool Ready | reduces retry waste | Legacy pre-call check, auto-fix, and blocking; hard-disabled |
 | OpenClaw plugin | — | RTK ✅, lossless live PostTool ✅, Schema/Retrieve unavailable in the host |
 | copilot-shell hooks | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅; Cosh-NG supports response compression and Marker-command recovery, while legacy copilot-shell remains lossless-only; Common BeforeModel passes schemas through without authorized Retrieve |
@@ -720,7 +720,15 @@ Shell sessions. PreToolUse rewrites both shell tool names; PostToolUse observes
 `mcp_list`, `mcp_get`, or `mcp_call` pass through without replacing their real
 output; full MCP responses remain compressible. File-content protection and RTK
 deduplication remain unchanged. Statistics use `qwenwork`, independently of Qoder CLI, Qwen Code,
-and QwenPaw.
+and QwenPaw. QwenWork workspace Shell hooks use the system user's default
+`~/.tokenless` directory or a valid absolute `TOKENLESS_DATA_DIR` for databases
+and Pre/Post state; `$HOME` does not redirect the default. Invalid paths pass
+through without creating state. Existing workspace databases are not migrated.
+Shell sandbox restrictions can prevent RTK statistics and execution receipts
+from being saved while commands and host Hook compression still work.
+Installation/detection reports this limitation and the current process's data
+directory without testing sandbox access. RTK's native database retains
+its own path configuration.
 
 After `anolisa install tokenless`, quit QwenWorkCN and explicitly sideload the plugin:
 
@@ -733,8 +741,8 @@ anolisa adapter status tokenless
 Restart QwenWorkCN and open a new session; check activation in the application.
 The CLI verifies managed files, while loading and activation remain `unknown`.
 It does not change settings or enable a disabled plugin. Linux VM sessions remain
-unsupported. Workspace Shell state uses the conversation working directory, and
-its single MCP text block is handled as shell output. Uninstall previous
+unsupported. Workspace Shell state follows the Tokenless data directory, and its
+single MCP text block is handled as shell output. Uninstall previous
 script-managed installations with their original script before enabling through
 the CLI; CLI-managed copies use `anolisa adapter disable tokenless qwenwork`.
 Installation, removal, and compatibility baselines are covered in

@@ -26,10 +26,9 @@ pub struct IndexWorker {
 }
 
 impl IndexWorker {
-    /// Synchronously perform the initial full-scan AND wait for the
-    /// inotify/FSEvents watcher to be registered before returning. By the
-    /// time this completes, every existing file is indexed and any
-    /// subsequent write to the mount tree will be picked up by the watcher.
+    /// Register the watcher before the synchronous initial full scan.
+    /// Changes made during the scan or embedding backfill are queued for
+    /// incremental indexing, just like writes made after startup returns.
     pub fn spawn(
         mount: MountPointLite,
         store: Arc<Mutex<BM25Store>>,
@@ -44,13 +43,16 @@ impl IndexWorker {
         // fix; the worker thread itself has no current runtime.
         let rt_handle = tokio::runtime::Handle::try_current().ok();
 
-        // 1. Sync full scan so the caller can safely read svc.index.count()
+        // Arm before scanning: embedding backfill may take multiple network
+        // round trips, during which another client can change the shared store.
+        let (event_tx, event_rx) = stdmpsc::channel::<notify::Result<notify::Event>>();
+        let watcher = watch_mount(&mount, event_tx)?;
+
+        // Preserve synchronous initial indexing. If it fails, the local
+        // watcher is dropped without starting an orphan worker thread.
         full_scan(&mount, &store, embedding.as_deref(), rt_handle.as_ref())?;
 
-        // 2. Spawn watcher thread. Use a oneshot mpsc to know when the
-        //    watcher has been wired up.
         let (cancel_tx, cancel_rx) = stdmpsc::channel::<()>();
-        let (ready_tx, ready_rx) = stdmpsc::sync_channel::<Result<()>>(1);
         let mount_clone = mount.clone();
         let store_clone = Arc::clone(&store);
         let emb_clone = embedding.clone();
@@ -59,27 +61,19 @@ impl IndexWorker {
         let handle = thread::Builder::new()
             .name("agentmem-index".into())
             .spawn(move || {
+                let _watcher = watcher;
                 if let Err(e) = run_watcher(
                     mount_clone,
                     store_clone,
                     emb_clone,
                     rt_clone,
                     cancel_rx,
-                    ready_tx,
+                    event_rx,
                 ) {
                     tracing::warn!("index watcher exited: {e}");
                 }
             })
             .map_err(|e| MemoryError::Other(format!("spawn index thread: {e}")))?;
-
-        // 3. Block until watcher is registered (or fails); reasonable timeout.
-        match ready_rx.recv_timeout(std::time::Duration::from_secs(3)) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                tracing::warn!("watcher took >3s to become ready; continuing without sync barrier");
-            }
-        }
 
         Ok(Self {
             handle: Some(handle),
@@ -93,6 +87,25 @@ impl IndexWorker {
             let _ = h.join();
         }
     }
+}
+
+fn watch_mount(
+    mount: &MountPointLite,
+    event_tx: stdmpsc::Sender<notify::Result<notify::Event>>,
+) -> Result<notify::RecommendedWatcher> {
+    let mut watcher = recommended_watcher(move |res| {
+        let _ = event_tx.send(res);
+    })
+    .map_err(|e| MemoryError::Other(format!("watcher init: {e}")))?;
+    watcher
+        .watch(&mount.root, RecursiveMode::Recursive)
+        .map_err(|e| MemoryError::Other(format!("watch: {e}")))?;
+    // Keep startup SQLite writes out of the event queue instead of discarding
+    // them later in classify. IndexHandle::open already created this subtree.
+    watcher
+        .unwatch(&mount.meta_dir)
+        .map_err(|e| MemoryError::Other(format!("unwatch meta: {e}")))?;
+    Ok(watcher)
 }
 
 /// Lightweight clone of MountPoint that the worker can own across threads.
@@ -134,29 +147,8 @@ fn run_watcher(
     embedding: Option<Arc<dyn EmbeddingProvider>>,
     rt_handle: Option<tokio::runtime::Handle>,
     cancel_rx: stdmpsc::Receiver<()>,
-    ready_tx: stdmpsc::SyncSender<Result<()>>,
+    event_rx: stdmpsc::Receiver<notify::Result<notify::Event>>,
 ) -> Result<()> {
-    let (event_tx, event_rx) = stdmpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = match recommended_watcher(move |res| {
-        let _ = event_tx.send(res);
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            let err = MemoryError::Other(format!("watcher init: {e}"));
-            let _ = ready_tx.send(Err(MemoryError::Other(err.to_string())));
-            return Err(err);
-        }
-    };
-
-    if let Err(e) = watcher.watch(&mount.root, RecursiveMode::Recursive) {
-        let err = MemoryError::Other(format!("watch: {e}"));
-        let _ = ready_tx.send(Err(MemoryError::Other(err.to_string())));
-        return Err(err);
-    }
-
-    // Watcher is now armed; signal readiness to the spawner.
-    let _ = ready_tx.send(Ok(()));
-
     // Debounce buffer: track unique paths touched since last flush
     let mut pending_modify: HashSet<PathBuf> = HashSet::new();
     let mut pending_remove: HashSet<PathBuf> = HashSet::new();
@@ -425,12 +417,19 @@ fn flush(
             Err(e) => tracing::warn!("index file removal failed for {rel}: {e}"),
         }
     }
+    let mut failed_text = HashSet::new();
     for (rel, mtime, size, body) in to_upsert {
         if let Err(e) = store.upsert(&rel, mtime, size, &body, agent_id.as_deref()) {
             tracing::warn!("index upsert failed for {rel}: {e}");
+            failed_text.insert(rel);
         }
     }
     for (rel, vec) in to_upsert_vec {
+        // A rolled-back text update must retain its old vector too; a failed
+        // insert must not leave a standalone vector for unindexed content.
+        if failed_text.contains(&rel) {
+            continue;
+        }
         if let Err(e) = store.upsert_vec(&rel, &vec) {
             tracing::warn!("index vector upsert failed for {rel}: {e}");
         }
@@ -447,6 +446,7 @@ fn full_scan(
 ) -> Result<()> {
     use walkdir::WalkDir;
 
+    let mut failed_text = HashSet::new();
     {
         let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
         let mut seen: HashSet<String> = HashSet::new();
@@ -496,6 +496,7 @@ fn full_scan(
             }
             if let Err(e) = store.upsert(&rel, mtime, meta.len(), &body, agent_id.as_deref()) {
                 tracing::warn!("index full-scan upsert failed for {rel}: {e}");
+                failed_text.insert(rel.clone());
             }
             seen.insert(rel);
         }
@@ -516,7 +517,7 @@ fn full_scan(
     // vector — e.g. pre-existing files at startup, or files recovered after
     // an inotify overflow. Without this, vector/hybrid search would miss any
     // file that never received a modify event after the provider was enabled.
-    backfill_vectors(mount, store, embedding, rt_handle)?;
+    backfill_vectors(mount, store, embedding, rt_handle, &failed_text)?;
 
     Ok(())
 }
@@ -530,6 +531,7 @@ fn backfill_vectors(
     store: &Arc<Mutex<BM25Store>>,
     embedding: Option<&dyn EmbeddingProvider>,
     rt_handle: Option<&tokio::runtime::Handle>,
+    failed_text: &HashSet<String>,
 ) -> Result<()> {
     if embedding.is_none() {
         return Ok(());
@@ -547,6 +549,11 @@ fn backfill_vectors(
     // embedding HTTP call would block every concurrent search.
     let mut to_upsert: Vec<(String, Vec<f32>)> = Vec::new();
     for rel in missing {
+        // The disk body may be newer than the row whose update just failed.
+        // Leave that row without a vector until its text can be reconciled.
+        if failed_text.contains(&rel) {
+            continue;
+        }
         let rel_path = Path::new(&rel);
         let body = match extract_text(mount.root_fd.as_fd(), rel_path) {
             Some(b) => b,
@@ -665,6 +672,71 @@ mod tests {
         (tmp, mount.clone_lite(), store)
     }
 
+    #[test]
+    fn watcher_excludes_startup_database_writes() {
+        use notify::event::{AccessKind, AccessMode};
+
+        let (_tmp, mount, _) = setup();
+        let index_dir = mount.meta_dir.join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let store = Arc::new(Mutex::new(
+            BM25Store::open(&index_dir.join("bm25.db"), 0.0, 0.0, false).unwrap(),
+        ));
+        let notes_dir = mount.root.join("notes");
+        std::fs::create_dir(&notes_dir).unwrap();
+        for i in 0..16 {
+            std::fs::write(notes_dir.join(format!("{i}.md")), "cobaltzebra").unwrap();
+        }
+        let (event_tx, event_rx) = stdmpsc::channel();
+        let _watcher = watch_mount(&mount, event_tx).unwrap();
+
+        let wal_path = index_dir.join("bm25.db-wal");
+        let wal_before = std::fs::metadata(&wal_path).unwrap().len();
+        full_scan(&mount, &store, None, None).unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .search("cobaltzebra", 20, false)
+                .unwrap()
+                .len(),
+            16
+        );
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > wal_before);
+
+        let external = notes_dir.join("0.md");
+        std::fs::write(&external, "heliotrope").unwrap();
+        let sentinel = mount.root.join("sentinel.md");
+        std::fs::write(&sentinel, "finished").unwrap();
+
+        // inotify preserves order: the sentinel's close follows the WAL writes
+        // and external modification, so absence is checked without a sleep.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut external_seen = false;
+        loop {
+            let event = event_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("missing sentinel event")
+                .expect("watcher error");
+            assert!(
+                !event
+                    .paths
+                    .iter()
+                    .any(|path| path.starts_with(&mount.meta_dir)),
+                "internal state reached the event queue: {event:?}"
+            );
+            if matches!(event.kind, EventKind::Modify(_)) && event.paths.contains(&external) {
+                external_seen = true;
+            }
+            if event.kind == EventKind::Access(AccessKind::Close(AccessMode::Write))
+                && event.paths.contains(&sentinel)
+            {
+                break;
+            }
+        }
+        assert!(external_seen, "external file modification was not watched");
+    }
+
     fn flush_path(mount: &MountPointLite, store: &Arc<Mutex<BM25Store>>, path: &str) {
         let mut modified = HashSet::from([mount.root.join(path)]);
         flush(mount, store, None, None, &mut modified, &mut HashSet::new()).unwrap();
@@ -771,6 +843,45 @@ mod tests {
             .expect("lock")
             .index_stat_for(rel)
             .unwrap_or_else(|| panic!("{rel} should be indexed"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_text_write_preserves_other_vectors_in_same_flush() {
+        let (_tmp, mount, _) = setup();
+        let db = mount.meta_dir.join("batch.db");
+        let store = Arc::new(Mutex::new(BM25Store::open(&db, 0.0, 0.0, false).unwrap()));
+        for path in ["failed.md", "healthy.md"] {
+            seed_file(&mount, &store, path);
+            write(&mount.root, path, "heliotrope replacement");
+        }
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_text_update BEFORE UPDATE ON files
+             WHEN OLD.path = 'failed.md'
+             BEGIN SELECT RAISE(ABORT, 'controlled text failure'); END;",
+        )
+        .unwrap();
+        let embedding = CountingEmbedding::new();
+        flush_rels(
+            &mount,
+            &store,
+            Some(&embedding),
+            &["failed.md", "healthy.md"],
+        );
+        let store = store.lock().unwrap();
+        assert_eq!(embedding.calls(), 2);
+        assert_eq!(
+            store.search("cobaltzebra", 10, false).unwrap()[0].path,
+            "failed.md"
+        );
+        assert_eq!(
+            store.search("heliotrope", 10, false).unwrap()[0].path,
+            "healthy.md"
+        );
+        let vectors = store.search_vec(&[1.0, 0.0], 10).unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors.iter().find(|v| v.0 == "failed.md").unwrap().1, 1.0);
+        assert_eq!(vectors.iter().find(|v| v.0 == "healthy.md").unwrap().1, 0.5);
     }
 
     #[test]

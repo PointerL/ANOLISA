@@ -24,7 +24,7 @@ Flag 迁移、Pipeline 行为和输出恢复详见
 | HTML 页面转写 | 取决于工作负载 | 默认开启：把命令或 API 返回的完整 HTML 文档转写为 Markdown，只移除可枚举的非内容元素（脚本、样式、导航、页眉、页脚、侧栏、表单控件、媒体嵌入）并在视图头部计数，提供原文恢复；通过 `TOKENLESS_HTML_EXTRACTION_ENABLED=0` 或 SDK `html_extraction_enabled=False` 关闭；文件读取透传 |
 | CSV/TSV 表格压缩 | 取决于具体负载 | 压紧引号和记录分隔符时保留全部单元格及行列顺序；无收益时返回原文。不采样删行，不写入 Stash。需要文本替换能力；文件读取透传 |
 | TOON 上下文压缩 | 参考响应 17.6% | 将 JSON 编码为 TOON 格式；自 TOON spec v4.4 起也覆盖嵌套 Record 数组与按 ID 建键的对象映射——这两种形状此前编码后大于紧凑 JSON |
-| 命令重写 | 60–90% | 通过 RTK 过滤 CLI 输出（支持 70+ 命令）；已识别的构建/测试命令，以及直接或经内置 Wrapper 调用的 `find`，使整条命令保持原生形式，关闭搜索路径共享也不改变此行为；RTK 自定义 Wrapper 前缀不在此保护范围 |
+| 命令重写 | 60–90% | 通过 RTK 过滤 CLI 输出（支持 70+ 命令）；已识别的构建/测试命令，以及直接或经内置 Wrapper 调用的 `find`、`head`、`tail`，使整条命令保持原生形式，关闭搜索路径共享也不改变此行为；RTK 自定义 Wrapper 前缀不在此保护范围 |
 | Tool Ready | 减少重试浪费 | 旧版调用前预检、自动修复与阻断；当前硬关闭 |
 
 表中 Schema、响应和 TOON 数字是当前仓库内置参考 fixture 的独立测试
@@ -375,7 +375,13 @@ PreToolUse 匹配两种 Shell 的工具名；
 PostToolUse **监听所有工具**，按公共策略压缩符合条件的完整结果。`mcp_list`、`mcp_get`、
 `mcp_call` 仅包含遥测信息的回调保持透传，不会用遥测替换真实响应；完整 MCP 响应仍可压缩。
 保留文件内容保护和 RTK 去重。统计归属为 `qwenwork`，
-与 Qoder CLI、Qwen Code、QwenPaw 独立。
+与 Qoder CLI、Qwen Code、QwenPaw 独立。千问办公工作区 Shell Hook 的数据库和
+Pre/Post 状态使用系统用户默认的 `~/.tokenless`，或 `TOKENLESS_DATA_DIR` 指定的
+有效绝对路径；`$HOME` 不会改变默认目录。路径无效时原样放行，不创建状态。
+已有工作区数据库不会自动迁移。
+Shell 沙箱限制可能导致 RTK 统计和执行回执无法保存，但命令和宿主 Hook 压缩仍可正常工作。
+安装/检测输出会说明这一限制及当前进程的数据目录，不执行沙箱可写性检测。
+RTK 原生数据库保留自身的路径配置。
 
 运行 `anolisa install tokenless` 后，退出千问办公，再显式旁加载插件：
 
@@ -387,7 +393,7 @@ anolisa adapter status tokenless
 
 完成后重启千问办公并开启新会话，在应用内检查激活状态。CLI 验证受管理文件，
 加载和激活状态保持 `unknown`。旁加载不修改 settings，也不自动启用已禁用的插件。
-Linux VM 会话仍不受支持。工作区 Shell 的状态保存在对话工作目录中，
+Linux VM 会话仍不受支持。工作区 Shell 的状态遵循 Tokenless 数据目录设置，
 其单个 MCP 文本块按 Shell 输出处理。已有脚本管理的安装需先用原脚本卸载，再通过 CLI 启用；
 CLI 管理的副本使用 `anolisa adapter disable tokenless qwenwork` 卸载。
 安装、卸载及兼容性基线参见[千问办公集成](../../docs/user-guide/zh/tokenless/framework-integration.md#千问办公macos)。
